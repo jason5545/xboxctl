@@ -9,7 +9,7 @@
 use crate::companion::{
     firmware::Image,
     protocol::DeviceInfo,
-    updater::{Event, Options, Session},
+    updater::{Event, FinishFlags, Options, Session},
 };
 use crate::feed;
 use crate::usb::{self, NanoDevice, NanoLink};
@@ -65,7 +65,7 @@ pub fn status(nano: &NanoDevice, trace: bool) -> Result<(), String> {
 /// update check uses, and has not been checked against physical hardware).
 ///
 /// Also returns the feed entry's `req` version, which decides the finish
-/// flags (see [`finish_flags_for`]); a local file has none.
+/// flags (see `Session::choose_finish_flags`); a local file has none.
 fn load_image(
     image_path: Option<&Path>,
     info: &DeviceInfo,
@@ -101,15 +101,6 @@ fn load_image(
     Ok((image, entry.required_version()))
 }
 
-/// Finish flags the SDK would send: `3` when the device runs firmware below
-/// the feed entry's `req` version, otherwise the plain foreground flag (`1`,
-/// left to `protocol::finish_request`). A physical Nano on 6.9.444.0 with
-/// `req` 6.19.50.0 discarded the image after finish flags `1` and applied it
-/// after `3`.
-fn finish_flags_for(running: [u16; 4], required: Option<[u16; 4]>) -> Option<u8> {
-    required.filter(|required| running < *required).map(|_| 3)
-}
-
 pub fn update(
     nano: &NanoDevice,
     image_path: Option<&Path>,
@@ -126,18 +117,15 @@ pub fn update(
     }
 
     let (image, required) = load_image(image_path, &info)?;
-    if session.finish_flags().is_none() {
-        if let Some(flags) = finish_flags_for(info.firmware_version, required) {
-            session.set_finish_flags(flags);
-        }
-    }
-    match (session.finish_flags(), required) {
-        (Some(flags), Some(required)) if finish_flags_for(info.firmware_version, Some(required)).is_some() => println!(
+    match session.choose_finish_flags(info.firmware_version, required) {
+        FinishFlags::Required { flags, required } => println!(
             "Finish flags      {flags} (firmware is below the feed's required {})",
             version(required)
         ),
-        (Some(flags), _) => println!("Finish flags      {flags} (XBOXCTL_NANO_FINISH_FLAGS)"),
-        (None, _) => println!("Finish flags      1 (default)"),
+        FinishFlags::Override(flags) => {
+            println!("Finish flags      {flags} (XBOXCTL_NANO_FINISH_FLAGS)")
+        }
+        FinishFlags::Default => println!("Finish flags      1 (default)"),
     }
     println!(
         "Image: firmware {} ({:#x} bytes)",
@@ -278,22 +266,5 @@ fn wait_for_restart(nano: &NanoDevice) -> Option<NanoDevice> {
             return None;
         }
         thread::sleep(Duration::from_millis(100));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::finish_flags_for;
-
-    #[test]
-    fn finishes_with_flags_3_below_the_required_version() {
-        assert_eq!(finish_flags_for([6, 9, 444, 0], Some([6, 19, 50, 0])), Some(3));
-    }
-
-    #[test]
-    fn default_finish_at_or_above_the_required_version_or_without_one() {
-        assert_eq!(finish_flags_for([6, 19, 50, 0], Some([6, 19, 50, 0])), None);
-        assert_eq!(finish_flags_for([6, 20, 0, 0], Some([6, 19, 50, 0])), None);
-        assert_eq!(finish_flags_for([6, 9, 444, 0], None), None);
     }
 }

@@ -65,6 +65,20 @@ impl Default for Options {
     }
 }
 
+/// Finish flags the SDK sends for an update the feed marks as required.
+pub const FINISH_FLAGS_REQUIRED: u8 = 3;
+
+/// Where the finish command's flags byte came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishFlags {
+    /// `XBOXCTL_NANO_FINISH_FLAGS`.
+    Override(u8),
+    /// The device is below the feed entry's `req` version.
+    Required { flags: u8, required: [u16; 4] },
+    /// The foreground flag from `protocol::finish_request` (`1`).
+    Default,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     UpToDate,
@@ -117,14 +131,30 @@ impl<'a, L: Link> Session<'a, L> {
         Err(format!("device did not accept a session after {attempts} attempts"))
     }
 
-    /// The finish flags override in effect, if any.
-    pub fn finish_flags(&self) -> Option<u8> {
-        self.options.finish_flags
-    }
-
-    /// Set the finish command's flags byte for this session.
-    pub fn set_finish_flags(&mut self, flags: u8) {
-        self.options.finish_flags = Some(flags);
+    /// Decide the finish command's flags byte the way the SDK does: `3` when
+    /// the device runs firmware below the feed entry's `req` version, else
+    /// the plain foreground flag. An explicit override
+    /// (`XBOXCTL_NANO_FINISH_FLAGS`) wins. A physical Nano on 6.9.444.0 with
+    /// `req` 6.19.50.0 discarded the image after flags `1` and applied it
+    /// after `3`.
+    pub fn choose_finish_flags(
+        &mut self,
+        running: [u16; 4],
+        required: Option<[u16; 4]>,
+    ) -> FinishFlags {
+        if let Some(flags) = self.options.finish_flags {
+            return FinishFlags::Override(flags);
+        }
+        match required {
+            Some(required) if running < required => {
+                self.options.finish_flags = Some(FINISH_FLAGS_REQUIRED);
+                FinishFlags::Required {
+                    flags: FINISH_FLAGS_REQUIRED,
+                    required,
+                }
+            }
+            _ => FinishFlags::Default,
+        }
     }
 
     /// Next device report. With `ack_device_1d`, also acks the device's own
@@ -440,6 +470,9 @@ mod tests {
         drop_subcommand_reply: Option<u8>,
         /// Swallow this many fragment frames before the device sees them.
         lose_fragments: u32,
+        /// Swallow every n-th fragment frame, spread over the transfer.
+        lose_every: Option<u32>,
+        fragments_seen: u32,
     }
 
     impl MockLink {
@@ -457,6 +490,8 @@ mod tests {
                 final_status_short: false,
                 drop_subcommand_reply: None,
                 lose_fragments: 0,
+                lose_every: None,
+                fragments_seen: 0,
             }
         }
     }
@@ -464,9 +499,15 @@ mod tests {
     impl Link for MockLink {
         fn send(&mut self, payload: &[u8]) -> Result<(), String> {
             self.sent.push(payload.to_vec());
-            if self.lose_fragments > 0 && Frame::parse(payload).is_some_and(|f| f.is_fragment()) {
-                self.lose_fragments -= 1;
-                return Ok(());
+            if Frame::parse(payload).is_some_and(|f| f.is_fragment()) {
+                self.fragments_seen += 1;
+                if self.lose_fragments > 0 {
+                    self.lose_fragments -= 1;
+                    return Ok(());
+                }
+                if self.lose_every.is_some_and(|n| self.fragments_seen % n == 0) {
+                    return Ok(());
+                }
             }
             let mut replies = self.endpoint.handle_report(payload);
             if let Some(request) = Frame::parse(payload) {
@@ -500,7 +541,7 @@ mod tests {
                     self.drop_session_replies -= 1;
                     return Ok(());
                 }
-                for reply in &mut replies {
+                for reply in replies.iter_mut().filter(|reply| reply[0] == 0xff) {
                     reply[6..9].copy_from_slice(&self.protocol_version);
                 }
             }
@@ -810,5 +851,301 @@ mod tests {
         session.update(&image, &mut record).unwrap();
         assert_eq!(events, vec![Event::UpToDate]);
         assert!(link.endpoint.device.written_data().is_empty());
+    }
+
+    // Scenario tests: a retail Nano as one behaved on hardware (protocol
+    // 2.0.13, firmware 6.9.444.0, status mode 4, a slot handed out by start,
+    // 0x1000 maximum chunk, finish flags 1 discarding the image below `req`),
+    // driven the way `nano::update` drives a session.
+
+    /// The live flight feed's entry for the retail Nano, verbatim.
+    const LIVE_FEED: &str = r#"{"g":"ga_flt","v":"1","p":"https://example.invalid/",
+        "d":[{"__n": "tala_PV", "id": "045E_0B4C-hw-0C06", "f": [{"p": "TALA_045E_0B4C-hw-0C06_v_6_19_50_0_h_3Jlk_LgL2mbGvoJfgteeSRUlQyBc2gk0PrxnPqIYHZM=.bin"}], "req": [{"v": "6.19.50.0"}], "reqApp": "6.19.50.0"}]}"#;
+
+    /// Image size of 6.19.50.0 on hardware.
+    const RETAIL_IMAGE_SIZE: usize = 0x263530;
+
+    fn retail_link() -> MockLink {
+        let mut link = MockLink::new([6, 9, 444, 0]);
+        link.protocol_version = [2, 0, 13];
+        let device = &mut link.endpoint.device;
+        device.mode = 4;
+        device.start_slot = 2;
+        device.max_chunk = 0x1000;
+        device.required_version = Some([6, 19, 50, 0]);
+        link
+    }
+
+    /// Defaults without the environment: tests must not pick up
+    /// `XBOXCTL_NANO_*` from the shell running them.
+    fn clean_options() -> Options {
+        Options {
+            finish_flags: None,
+            ack_device_1d: false,
+            ..Options::default()
+        }
+    }
+
+    fn retail_image(len: usize) -> Image {
+        Image {
+            version: [6, 19, 50, 0],
+            data: (0..len).map(|i| (i * 7 + i / 251) as u8).collect(),
+        }
+    }
+
+    /// What `nano::update` does before writing: read the device, find its
+    /// feed entry by hardware revision, pick the finish flags.
+    fn plan(session: &mut Session<'_, MockLink>, feed_json: &str) -> (DeviceInfo, FinishFlags) {
+        let info = session.device_info().unwrap();
+        let feed = crate::feed::Feed::parse(feed_json).unwrap();
+        let entry = feed
+            .device_by_hardware_revision(info.vendor_id, info.hardware_revision)
+            .expect("feed entry for the device");
+        let flags = session.choose_finish_flags(info.firmware_version, entry.required_version());
+        (info, flags)
+    }
+
+    fn update_payloads(link: &MockLink, subcommand: u8) -> Vec<Vec<u8>> {
+        // Fragments of a write carry no subcommand byte of their own; only
+        // first/single frames do.
+        link.sent
+            .iter()
+            .filter_map(|bytes| Frame::parse(bytes))
+            .filter(|frame| {
+                frame.opcode == protocol::OP_UPDATE
+                    && matches!(frame.kind, frame::TYPE_SINGLE | frame::TYPE_FIRST)
+                    && frame.payload.first() == Some(&subcommand)
+            })
+            .map(|frame| frame.payload)
+            .collect()
+    }
+
+    #[test]
+    fn retail_nano_updates_with_required_finish_flags() {
+        let mut link = retail_link();
+        let image = retail_image(0x3000);
+        let mut session = Session::open(&mut link, 0x1234_5678, clean_options()).unwrap();
+        let (info, flags) = plan(&mut session, LIVE_FEED);
+        assert_eq!(info.hardware_revision, 0x0c06);
+        assert_eq!(info.firmware_version, [6, 9, 444, 0]);
+        assert_eq!(
+            flags,
+            FinishFlags::Required { flags: 3, required: [6, 19, 50, 0] }
+        );
+        session.update(&image, &mut |_| {}).unwrap();
+        drop(session);
+
+        assert_eq!(link.endpoint.device.firmware_version, [6, 19, 50, 0]);
+        assert_eq!(link.endpoint.discarded_finishes, 0);
+        assert_eq!(link.endpoint.device.written_data(), &image.data[..]);
+        assert_eq!(update_payloads(&link, protocol::SUB_FINISH), vec![vec![protocol::SUB_FINISH, 2, 3]]);
+        let writes = update_payloads(&link, protocol::SUB_WRITE);
+        assert!(!writes.is_empty());
+        assert!(writes.iter().all(|write| write[1] == 2), "every write echoes slot 2");
+    }
+
+    #[test]
+    fn retail_nano_discards_the_image_with_finish_flags_1() {
+        // What happened on hardware before the fix: finish answered `13 00`,
+        // yet the device came back on the old firmware. The session cannot
+        // see that; `nano::update` catches it by reading the version after
+        // the restart.
+        let mut link = retail_link();
+        let image = retail_image(0x3000);
+        let options = Options { finish_flags: Some(1), ..clean_options() };
+        let mut session = Session::open(&mut link, 0x1234_5678, options).unwrap();
+        let (_, flags) = plan(&mut session, LIVE_FEED);
+        assert_eq!(flags, FinishFlags::Override(1));
+        session.update(&image, &mut |_| {}).unwrap();
+        drop(session);
+
+        assert_eq!(update_payloads(&link, protocol::SUB_FINISH), vec![vec![protocol::SUB_FINISH, 2, 1]]);
+        assert_eq!(link.endpoint.discarded_finishes, 1);
+        assert_eq!(link.endpoint.device.firmware_version, [6, 9, 444, 0]);
+    }
+
+    #[test]
+    fn default_finish_flags_at_or_above_the_required_version() {
+        let mut link = retail_link();
+        link.endpoint.device.firmware_version = [6, 19, 50, 0];
+        let image = Image { version: [6, 20, 0, 0], data: vec![0x5a; 0x2000] };
+        let mut session = Session::open(&mut link, 0x1234_5678, clean_options()).unwrap();
+        let (_, flags) = plan(&mut session, LIVE_FEED);
+        assert_eq!(flags, FinishFlags::Default);
+        session.update(&image, &mut |_| {}).unwrap();
+        drop(session);
+
+        assert_eq!(update_payloads(&link, protocol::SUB_FINISH), vec![vec![protocol::SUB_FINISH, 2, 1]]);
+        assert_eq!(link.endpoint.device.firmware_version, [6, 20, 0, 0]);
+    }
+
+    #[test]
+    fn retail_nano_already_on_the_feed_version_writes_nothing() {
+        let mut link = retail_link();
+        link.endpoint.device.firmware_version = [6, 19, 50, 0];
+        let mut session = Session::open(&mut link, 0x1234_5678, clean_options()).unwrap();
+        let (info, flags) = plan(&mut session, LIVE_FEED);
+        assert_eq!(flags, FinishFlags::Default);
+        // `nano::update` stops here when the versions match; the session
+        // itself also refuses to write.
+        assert_eq!(info.firmware_version, retail_image(1).version);
+        let mut events = Vec::new();
+        session.update(&retail_image(0x100), &mut |event| events.push(event.clone())).unwrap();
+        drop(session);
+        assert_eq!(events, vec![Event::UpToDate]);
+        assert!(update_payloads(&link, protocol::SUB_START).is_empty());
+    }
+
+    #[test]
+    fn a_local_image_has_no_required_version() {
+        let mut link = retail_link();
+        let mut session = Session::open(&mut link, 0x1234_5678, clean_options()).unwrap();
+        assert_eq!(session.choose_finish_flags([6, 9, 444, 0], None), FinishFlags::Default);
+    }
+
+    #[test]
+    fn override_wins_over_the_required_version() {
+        let mut link = retail_link();
+        let options = Options { finish_flags: Some(3), ..clean_options() };
+        let mut session = Session::open(&mut link, 0x1234_5678, options).unwrap();
+        assert_eq!(
+            session.choose_finish_flags([6, 19, 50, 0], Some([6, 19, 50, 0])),
+            FinishFlags::Override(3)
+        );
+    }
+
+    #[test]
+    fn full_size_image_takes_612_writes_of_0xffd_bytes() {
+        // On hardware: a 0x1002 session maximum gives 0xffd-byte chunks, so
+        // 612 writes for the 0x263530-byte image.
+        let mut link = retail_link();
+        let image = retail_image(RETAIL_IMAGE_SIZE);
+        let mut session = Session::open(&mut link, 0x1234_5678, clean_options()).unwrap();
+        plan(&mut session, LIVE_FEED);
+        session.update(&image, &mut |_| {}).unwrap();
+        drop(session);
+
+        assert_eq!(update_payloads(&link, protocol::SUB_WRITE).len(), 612);
+        assert_eq!(link.endpoint.device.written_data(), &image.data[..]);
+        assert_eq!(link.endpoint.device.firmware_version, [6, 19, 50, 0]);
+    }
+
+    #[test]
+    fn unacked_keepalive_kills_the_link_before_finish() {
+        let mut link = retail_link();
+        link.endpoint.keepalive_limit = Some(1_000);
+        let image = retail_image(RETAIL_IMAGE_SIZE);
+        let mut session = Session::open(&mut link, 0x1234_5678, clean_options()).unwrap();
+        plan(&mut session, LIVE_FEED);
+        let error = session.update(&image, &mut |_| {}).unwrap_err();
+        drop(session);
+
+        assert!(error.contains("no ack") || error.contains("no response"), "{error}");
+        assert!(link.endpoint.dead);
+        assert!(update_payloads(&link, protocol::SUB_FINISH).is_empty());
+        assert_eq!(link.endpoint.device.firmware_version, [6, 9, 444, 0]);
+    }
+
+    #[test]
+    fn acked_keepalive_keeps_the_link_up() {
+        let mut link = retail_link();
+        link.endpoint.keepalive_limit = Some(1_000);
+        let image = retail_image(RETAIL_IMAGE_SIZE);
+        let options = Options { ack_device_1d: true, ..clean_options() };
+        let mut session = Session::open(&mut link, 0x1234_5678, options).unwrap();
+        plan(&mut session, LIVE_FEED);
+        session.update(&image, &mut |_| {}).unwrap();
+        drop(session);
+
+        assert!(!link.endpoint.dead);
+        assert_eq!(link.endpoint.device.written_data(), &image.data[..]);
+        assert_eq!(link.endpoint.device.firmware_version, [6, 19, 50, 0]);
+    }
+
+    #[test]
+    fn rerun_after_a_drop_resumes_and_finishes() {
+        // The workaround used on hardware: when the link dies, replug and
+        // run the same command again; start reports where to resume.
+        let mut link = retail_link();
+        link.endpoint.keepalive_limit = Some(15_000);
+        link.endpoint.device.resume = true;
+        let image = retail_image(RETAIL_IMAGE_SIZE);
+        let mut offsets = Vec::new();
+        let mut runs = 0;
+        loop {
+            runs += 1;
+            assert!(runs <= 20, "did not finish in 20 runs");
+            let mut session = Session::open(&mut link, 0x1000 + runs, clean_options()).unwrap();
+            let (info, flags) = plan(&mut session, LIVE_FEED);
+            assert_eq!(info.firmware_version, [6, 9, 444, 0]);
+            assert_eq!(flags, FinishFlags::Required { flags: 3, required: [6, 19, 50, 0] });
+            let result = session.update(&image, &mut |event| {
+                if let Event::Begin { resume_offset, .. } = event {
+                    offsets.push(*resume_offset);
+                }
+            });
+            drop(session);
+            match result {
+                Ok(()) => break,
+                Err(_) => link.endpoint.replug(),
+            }
+        }
+
+        assert!(runs >= 2, "the keepalive limit should have cut at least one run");
+        assert_eq!(offsets[0], 0);
+        assert!(offsets.windows(2).all(|pair| pair[0] < pair[1]), "{offsets:?}");
+        assert!(offsets.iter().all(|offset| offset % 0xffd == 0), "{offsets:?}");
+        assert_eq!(link.endpoint.device.written_data(), &image.data[..]);
+        assert_eq!(link.endpoint.device.firmware_version, [6, 19, 50, 0]);
+        assert_eq!(update_payloads(&link, protocol::SUB_FINISH).len(), 1);
+    }
+
+    #[test]
+    fn retail_nano_survives_resent_replies_lost_fragments_and_keepalive() {
+        let mut link = retail_link();
+        link.resend_replies = true;
+        // Hardware left 14 or 15 fragments unacked in a 387-block run; lose
+        // far more than that, one at a time.
+        link.lose_every = Some(97);
+        link.endpoint.keepalive_limit = Some(1_000);
+        let image = retail_image(0x20000);
+        let options = Options { ack_device_1d: true, ..clean_options() };
+        let mut session = Session::open(&mut link, 0x1234_5678, options).unwrap();
+        plan(&mut session, LIVE_FEED);
+        session.update(&image, &mut |_| {}).unwrap();
+        drop(session);
+
+        assert_eq!(link.endpoint.device.written_data(), &image.data[..]);
+        assert_eq!(link.endpoint.device.firmware_version, [6, 19, 50, 0]);
+        assert_eq!(update_payloads(&link, protocol::SUB_FINISH), vec![vec![protocol::SUB_FINISH, 2, 3]]);
+    }
+
+    #[test]
+    fn wrong_slot_is_refused_by_the_fake() {
+        // Guards the fake itself: if the host ignored the slot from start,
+        // the scenario tests above would fail rather than pass by accident.
+        let mut link = retail_link();
+        let mut session = Session::open(&mut link, 0x1234_5678, clean_options()).unwrap();
+        let status = session.update_status().unwrap();
+        let start = session.start_update(&status, &retail_image(0x100)).unwrap();
+        assert_eq!(start.slot, 2);
+        let reply = session.write_block(0, 0, &[1, 2, 3]).unwrap();
+        assert_eq!(reply.status, Status::DeviceFailed);
+        assert_eq!(session.finish_update(0).unwrap(), Status::DeviceFailed);
+        assert_eq!(session.write_block(2, 0, &[1, 2, 3]).unwrap().status, Status::Ok);
+    }
+
+    #[test]
+    fn spread_fragment_loss_is_recovered() {
+        let mut link = retail_link();
+        link.lose_every = Some(97);
+        let image = retail_image(RETAIL_IMAGE_SIZE);
+        let mut session = Session::open(&mut link, 0x1234_5678, clean_options()).unwrap();
+        plan(&mut session, LIVE_FEED);
+        session.update(&image, &mut |_| {}).unwrap();
+        drop(session);
+        assert!(link.fragments_seen > 40_000);
+        assert_eq!(link.endpoint.device.written_data(), &image.data[..]);
+        assert_eq!(link.endpoint.device.firmware_version, [6, 19, 50, 0]);
     }
 }

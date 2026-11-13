@@ -16,6 +16,12 @@ const FRAGMENT_DATA: usize = 57;
 /// sequence byte (0), which `open_session` always sends.
 const HANDLE: u8 = 0x7e;
 
+/// The device's unsolicited frames come on the handle after the session's.
+const KEEPALIVE_HANDLE: u8 = HANDLE + 1;
+const KEEPALIVE_OPCODE: u8 = 0x1d;
+/// Constant for a whole session on the physical Nano.
+const KEEPALIVE_SEQ: u8 = 0x40;
+
 pub struct FakeNano {
     pub vendor_id: u16,
     pub product_id: u16,
@@ -28,6 +34,18 @@ pub struct FakeNano {
     /// Test knobs: under-report the written count; flags byte of write replies.
     pub lose_bytes: u32,
     pub write_flags: u8,
+    /// Mode byte of the status reply (27); a physical Nano reports `4`.
+    pub mode: u8,
+    /// Slot the start reply hands out; a physical Nano returned 1, 2, 3.
+    pub start_slot: u8,
+    /// The feed's `req` version. As on a physical Nano, a device below it
+    /// discards the staged image unless finish carries flag bit 1.
+    pub required_version: Option<[u16; 4]>,
+    /// Keep a partly written image across sessions and report where to
+    /// resume, as a physical Nano did after an aborted run.
+    pub resume: bool,
+    /// Version of the image being staged, for resume.
+    staged_version: Option<[u16; 4]>,
 }
 
 impl FakeNano {
@@ -43,6 +61,11 @@ impl FakeNano {
             written: Vec::new(),
             lose_bytes: 0,
             write_flags: 0,
+            mode: 0,
+            start_slot: 0,
+            required_version: None,
+            resume: false,
+            staged_version: None,
         }
     }
 
@@ -72,14 +95,37 @@ impl FakeNano {
                 for (i, word) in self.firmware_version.iter().enumerate() {
                     out[18 + i * 2..18 + i * 2 + 2].copy_from_slice(&word.to_le_bytes());
                 }
+                out[27] = self.mode;
                 out[32..34].copy_from_slice(&self.max_chunk.to_le_bytes());
                 let written = (self.written.len() as u32).saturating_sub(self.lose_bytes);
                 out[60..64].copy_from_slice(&written.to_le_bytes());
                 out
             }
             Some(protocol::SUB_START) if payload.len() >= 27 => {
-                self.written.clear();
-                vec![protocol::SUB_START, 0, 0, 0, 0, 0, self.slot]
+                let version: [u16; 4] = std::array::from_fn(|i| {
+                    u16::from_le_bytes([payload[17 + i * 2], payload[17 + i * 2 + 1]])
+                });
+                let resume_offset = if self.resume && self.staged_version == Some(version) {
+                    self.written.len() as u32
+                } else {
+                    self.written.clear();
+                    0
+                };
+                self.staged_version = Some(version);
+                self.slot = self.start_slot;
+                let mut out = vec![protocol::SUB_START, 0];
+                out.extend_from_slice(&resume_offset.to_le_bytes());
+                out.push(self.slot);
+                out
+            }
+            Some(protocol::SUB_WRITE | protocol::SUB_FINISH) if payload.get(1) != Some(&self.slot) => {
+                // Wrong slot: refuse, as a device would for a slot it did
+                // not hand out.
+                if payload[0] == protocol::SUB_WRITE {
+                    vec![payload[0], 6, 0]
+                } else {
+                    vec![payload[0], 6]
+                }
             }
             Some(protocol::SUB_WRITE) if payload.len() >= 5 => {
                 let offset = u32::from_le_bytes([payload[2], payload[3], payload[4], 0]) as usize;
@@ -104,6 +150,16 @@ impl FakeNano {
 
 pub struct CompanionEndpoint {
     pub device: FakeNano,
+    /// Send an unsolicited `05 <handle+1> 1d <seq> 00` after every host
+    /// report, and go silent once more than this many are left unacked: a
+    /// model of the physical Nano that stopped answering after about 1,430
+    /// unacked repeats. The real trigger is a guess.
+    pub keepalive_limit: Option<u32>,
+    unacked_keepalive: u32,
+    /// Silent until [`CompanionEndpoint::replug`].
+    pub dead: bool,
+    /// How many times finish was accepted but the image was discarded.
+    pub discarded_finishes: u32,
     reassembler: Reassembler,
     device_seq: Sequence,
     pending: VecDeque<Vec<u8>>,
@@ -120,12 +176,52 @@ impl CompanionEndpoint {
             device_seq: Sequence::default(),
             pending: VecDeque::new(),
             pending_version: None,
+            keepalive_limit: None,
+            unacked_keepalive: 0,
+            dead: false,
+            discarded_finishes: 0,
         }
+    }
+
+    /// Unplug and plug back in: protocol state resets, a staged image stays.
+    pub fn replug(&mut self) {
+        self.reassembler = Reassembler::default();
+        self.device_seq = Sequence::default();
+        self.pending.clear();
+        self.unacked_keepalive = 0;
+        self.dead = false;
     }
 
     /// Feed one incoming HID report payload (after the `0x0c` ID); returns
     /// the report payloads to send back, in order.
     pub fn handle_report(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
+        if self.dead {
+            return Vec::new();
+        }
+        if let Some(frame) = Frame::parse(bytes) {
+            if frame.kind == frame::TYPE_ACK
+                && frame.handle == KEEPALIVE_HANDLE
+                && frame.opcode == KEEPALIVE_OPCODE
+            {
+                if frame.seq == KEEPALIVE_SEQ.wrapping_add(1) {
+                    self.unacked_keepalive = 0;
+                }
+                return Vec::new();
+            }
+        }
+        let mut out = self.handle_protocol(bytes);
+        if let Some(limit) = self.keepalive_limit {
+            if self.unacked_keepalive >= limit {
+                self.dead = true;
+                return Vec::new();
+            }
+            self.unacked_keepalive += 1;
+            out.push(vec![frame::TYPE_SINGLE, KEEPALIVE_HANDLE, KEEPALIVE_OPCODE, KEEPALIVE_SEQ, 0]);
+        }
+        out
+    }
+
+    fn handle_protocol(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
         if bytes.first() == Some(&0xff) {
             return self.session_accept(bytes);
         }
@@ -146,9 +242,24 @@ impl CompanionEndpoint {
                         u16::from_le_bytes([message[17 + i * 2], message[17 + i * 2 + 1]])
                     }));
                 } else if message.first() == Some(&protocol::SUB_FINISH)
+                    && message.get(1) == Some(&self.device.slot)
                     && let Some(version) = self.pending_version.take()
                 {
-                    self.device.firmware_version = version;
+                    let flags = message.get(2).copied().unwrap_or(0);
+                    let below_required = self
+                        .device
+                        .required_version
+                        .is_some_and(|required| self.device.firmware_version < required);
+                    if below_required && flags & 2 == 0 {
+                        // Seen on a physical Nano: finish `13 00`, restart,
+                        // back on the old firmware with the image discarded.
+                        self.discarded_finishes += 1;
+                    } else {
+                        self.device.firmware_version = version;
+                    }
+                    // Written bytes stay readable for tests; nothing is
+                    // left to resume.
+                    self.device.staged_version = None;
                 }
             }
             let response = match frame.opcode {
