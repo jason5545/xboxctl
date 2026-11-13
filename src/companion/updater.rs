@@ -785,7 +785,7 @@ mod tests {
             session.device_info().unwrap();
             drop(session);
             let ack = frame::ack(device_handle, OP_DEVICE_1D, 7);
-            assert_eq!(link.sent.iter().any(|p| *p == ack), enabled, "enabled={enabled}");
+            assert_eq!(link.sent.contains(&ack), enabled, "enabled={enabled}");
         }
     }
 
@@ -1556,7 +1556,7 @@ mod tests {
         open(&mut link).update(&image, &mut |_| {}).unwrap();
         assert_eq!(link.endpoint.device.written_data(), &image.data[..]);
         let ack = frame::ack(0x7e, protocol::OP_UPDATE, 0x33);
-        assert!(link.sent.iter().any(|p| *p == ack), "the late reply was not acked");
+        assert!(link.sent.contains(&ack), "the late reply was not acked");
     }
 
     #[test]
