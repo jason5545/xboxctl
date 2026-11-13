@@ -68,6 +68,26 @@ impl Default for Options {
 /// Finish flags the SDK sends for an update the feed marks as required.
 pub const FINISH_FLAGS_REQUIRED: u8 = 3;
 
+/// The finish flags for a device running `running` against the feed's
+/// `required` version, with an optional override; see
+/// [`Session::choose_finish_flags`].
+pub fn finish_flags_for(
+    override_flags: Option<u8>,
+    running: [u16; 4],
+    required: Option<[u16; 4]>,
+) -> FinishFlags {
+    if let Some(flags) = override_flags {
+        return FinishFlags::Override(flags);
+    }
+    match required {
+        Some(required) if running < required => FinishFlags::Required {
+            flags: FINISH_FLAGS_REQUIRED,
+            required,
+        },
+        _ => FinishFlags::Default,
+    }
+}
+
 /// Where the finish command's flags byte came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinishFlags {
@@ -142,19 +162,11 @@ impl<'a, L: Link> Session<'a, L> {
         running: [u16; 4],
         required: Option<[u16; 4]>,
     ) -> FinishFlags {
-        if let Some(flags) = self.options.finish_flags {
-            return FinishFlags::Override(flags);
+        let choice = finish_flags_for(self.options.finish_flags, running, required);
+        if let FinishFlags::Required { flags, .. } = choice {
+            self.options.finish_flags = Some(flags);
         }
-        match required {
-            Some(required) if running < required => {
-                self.options.finish_flags = Some(FINISH_FLAGS_REQUIRED);
-                FinishFlags::Required {
-                    flags: FINISH_FLAGS_REQUIRED,
-                    required,
-                }
-            }
-            _ => FinishFlags::Default,
-        }
+        choice
     }
 
     /// Next device report. With `ack_device_1d`, also acks the device's own

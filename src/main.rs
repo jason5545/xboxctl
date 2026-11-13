@@ -632,11 +632,16 @@ fn update(
     yes: bool,
     trace: bool,
 ) -> Result<(), String> {
-    if let Ok(usb::AnyDevice::Nano(nano)) = usb::select_device(device) {
-        println!("{}", describe_nano(&nano));
-        return nano::update(&nano, image, dry_run, yes, trace);
+    // Same selection as `info`: an error (several devices, none, a bad
+    // --device) stops here instead of falling through to the GIP path,
+    // which would then update whichever GIP controller it finds.
+    match usb::select_device(device)? {
+        usb::AnyDevice::Nano(nano) => {
+            println!("{}", describe_nano(&nano));
+            nano::update(&nano, image, dry_run, yes, trace)
+        }
+        usb::AnyDevice::Gip(_) => update_gip(image, device, dry_run, yes, trace),
     }
-    update_gip(image, device, dry_run, yes, trace)
 }
 
 /// Install `image` on a GIP controller, or the feed's current firmware when

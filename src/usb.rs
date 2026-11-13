@@ -685,10 +685,13 @@ impl NanoLink {
             eprintln!("HID interface {}, IN {:#04x}/{} bytes, OUT {:#04x}/{} bytes",
                 device.interface, device.endpoint_in.0, device.endpoint_in.1,
                 device.endpoint_out.0, device.endpoint_out.1);
-            let other = holders::find(device.vendor_id, device.product_id, device.bus, device.address);
-            if !other.is_empty() {
-                eprintln!("Warning: {}", holders::sentence(&other));
-            }
+        }
+        // Programs holding the controller broke the session on a physical
+        // Nano; say so in every build, not only with tracing. Detection may
+        // miss programs that open it through HID.
+        let other = holders::find(device.vendor_id, device.product_id, device.bus, device.address);
+        if !other.is_empty() {
+            eprintln!("Warning: {}", holders::sentence(&other));
         }
         let handle = device.device.open().map_err(|error| match error {
             rusb::Error::Access => {

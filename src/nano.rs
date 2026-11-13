@@ -9,7 +9,7 @@
 use crate::companion::{
     firmware::Image,
     protocol::DeviceInfo,
-    updater::{Event, FinishFlags, Options, Session},
+    updater::{finish_flags_for, Event, FinishFlags, Options, Session},
 };
 use crate::feed;
 use crate::usb::{self, NanoDevice, NanoLink};
@@ -101,6 +101,18 @@ fn load_image(
     Ok((image, entry.required_version()))
 }
 
+/// The finish flags, worded for the user.
+fn describe_finish_flags(choice: FinishFlags) -> String {
+    match choice {
+        FinishFlags::Override(flags) => format!("{flags} (XBOXCTL_NANO_FINISH_FLAGS)"),
+        FinishFlags::Required { flags, required } => format!(
+            "{flags} (firmware is below the feed's required {})",
+            version(required)
+        ),
+        FinishFlags::Default => "1 (default)".to_owned(),
+    }
+}
+
 pub fn update(
     nano: &NanoDevice,
     image_path: Option<&Path>,
@@ -108,25 +120,21 @@ pub fn update(
     yes: bool,
     trace: bool,
 ) -> Result<(), String> {
-    let mut link = NanoLink::open(nano, trace)?;
-    let mut session = open_session(&mut link)?;
-    let info = session.device_info()?;
+    // Read the device, then close the session before downloading and
+    // asking for confirmation: an open session that nobody reads piles up
+    // the device's unacked 1d frames, and a physical Nano dropped the link
+    // after about three minutes of them.
+    let info = {
+        let mut link = NanoLink::open(nano, trace)?;
+        let mut session = open_session(&mut link)?;
+        session.device_info()?
+    };
     print_device_info(&info);
     if !info.is_updatable() {
         return Err("the device does not report itself as updatable".to_owned());
     }
 
     let (image, required) = load_image(image_path, &info)?;
-    match session.choose_finish_flags(info.firmware_version, required) {
-        FinishFlags::Required { flags, required } => println!(
-            "Finish flags      {flags} (firmware is below the feed's required {})",
-            version(required)
-        ),
-        FinishFlags::Override(flags) => {
-            println!("Finish flags      {flags} (XBOXCTL_NANO_FINISH_FLAGS)")
-        }
-        FinishFlags::Default => println!("Finish flags      1 (default)"),
-    }
     println!(
         "Image: firmware {} ({:#x} bytes)",
         image.version_string(),
@@ -136,6 +144,24 @@ pub fn update(
         println!("The device already runs this firmware; nothing to do.");
         return Ok(());
     }
+    if image.version < info.firmware_version {
+        return Err(format!(
+            "the image ({}) is older than the device's firmware ({}); refusing to downgrade",
+            image.version_string(),
+            version(info.firmware_version)
+        ));
+    }
+    let options = Options::default();
+    let planned = finish_flags_for(options.finish_flags, info.firmware_version, required);
+    println!("Finish flags      {}", describe_finish_flags(planned));
+    println!(
+        "1d acks           {}",
+        if options.ack_device_1d {
+            "on (XBOXCTL_NANO_ACK_1D=1)"
+        } else {
+            "off"
+        }
+    );
     if dry_run {
         println!(
             "Would update {} -> {}",
@@ -147,9 +173,9 @@ pub fn update(
     if !yes {
         println!(
             "\nThis writes firmware to the device and will restart it. Keep it connected \
-             until the update finishes. This path has not been exercised against a physical \
-             Nano, only an emulated one (see docs/nano.md); an interrupted or failed update \
-             may leave the device unusable."
+             until the update finishes. This path has been checked against a model of the \
+             retail Nano, not against the hardware itself (see docs/nano.md); an interrupted \
+             or failed update may leave the device unusable."
         );
         print!("Type 'update' to continue: ");
         io::stdout().flush().ok();
@@ -161,6 +187,29 @@ pub fn update(
         if answer.trim() != "update" {
             return Err("cancelled".to_owned());
         }
+    }
+
+    // A fresh session for the write, checked against what was shown above.
+    let mut link = NanoLink::open(nano, trace)?;
+    let mut session = open_session(&mut link)?;
+    let now = session.device_info()?;
+    if now.hardware_revision != info.hardware_revision || now.firmware_version != info.firmware_version {
+        return Err(format!(
+            "the device changed since it was read (hardware {:#06x}, firmware {} -> {:#06x}, {}); \
+             not writing. Run the command again.",
+            info.hardware_revision,
+            version(info.firmware_version),
+            now.hardware_revision,
+            version(now.firmware_version)
+        ));
+    }
+    let chosen = session.choose_finish_flags(now.firmware_version, required);
+    if chosen != planned {
+        return Err(format!(
+            "finish flags changed between the check and the write ({} -> {}); not writing",
+            describe_finish_flags(planned),
+            describe_finish_flags(chosen)
+        ));
     }
 
     let mut line = crate::progress::ProgressLine::new();
