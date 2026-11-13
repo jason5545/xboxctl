@@ -73,6 +73,22 @@ enum Command {
         #[arg(long)]
         ble: Option<PathBuf>,
     },
+    /// Hold a Nano session open and read the battery every 15 s, fetching
+    /// telemetry when the device taps for it: an experiment on what keeps
+    /// it answering past about 3.5 minutes. Read-only.
+    #[cfg(target_os = "macos")]
+    #[command(hide = true)]
+    NanoHold {
+        /// Use the Bluetooth LE GATT channel through this nano-ble-bridge app.
+        #[arg(long)]
+        ble: Option<PathBuf>,
+        /// How long to hold the session.
+        #[arg(long, default_value_t = 300)]
+        seconds: u64,
+        /// Only ack the device's taps, as before, instead of fetching.
+        #[arg(long)]
+        no_fetch: bool,
+    },
     /// Download the current firmware for a GIP controller from Microsoft's
     /// firmware feed (the one the Xbox Accessories app uses).
     Download {
@@ -186,6 +202,13 @@ fn main() {
         #[cfg(target_os = "macos")]
         Command::NanoProbe { ble } => {
             if let Err(error) = nano::probe(ble.as_deref(), trace_packets) {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+        #[cfg(target_os = "macos")]
+        Command::NanoHold { ble, seconds, no_fetch } => {
+            if let Err(error) = nano::hold(ble.as_deref(), seconds, !no_fetch, trace_packets) {
                 eprintln!("{error}");
                 std::process::exit(1);
             }

@@ -45,11 +45,44 @@ pub struct Options {
     /// plugged in with them, as it had after about 1,430 unacked repeats
     /// without. `XBOXCTL_NANO_ACK_1D=0` turns them off.
     pub ack_device_1d: bool,
+    /// Fetch telemetry when the device taps for it. An empty `1d` on the
+    /// device's channel (handle + 1) means "telemetry pending"; the
+    /// Accessories SDK answers it with `1d` requests until a reply comes
+    /// back empty (Sean13128's reading of `xaccessories_sdk_svc.dll`,
+    /// 0x18004b3d0, on bb441db/xboxctl#18). Whether that is what keeps a
+    /// Nano answering past about 3.5 minutes is not tested on hardware.
+    /// `XBOXCTL_NANO_FETCH_1D=0` turns it off.
+    pub fetch_telemetry: bool,
 }
 
-/// The device's own unsolicited message opcode seen during a Nano session.
+/// Telemetry: the device's empty tap on handle + 1, and the request that
+/// fetches one record on the session's handle.
+const OP_TELEMETRY: u8 = 0x1d;
 #[cfg(test)]
-const OP_DEVICE_1D: u8 = 0x1d;
+const OP_DEVICE_1D: u8 = OP_TELEMETRY;
+/// The SDK's timeout for one telemetry fetch.
+const TELEMETRY_TIMEOUT: Duration = Duration::from_secs(5);
+/// The SDK loops until an empty reply; a device that never sends one must
+/// not hold the session hostage.
+const MAX_TELEMETRY_FETCHES: u32 = 64;
+
+/// What a session has seen of the device's telemetry.
+#[derive(Debug, Clone, Default)]
+pub struct Telemetry {
+    /// Empty `1d` taps on the device's channel.
+    pub taps: u32,
+    /// Records: non-empty replies to `1d` requests, and `1d` frames on the
+    /// device's channel that carried a payload themselves.
+    pub records: u32,
+    /// The last record, for traces.
+    pub last_record: Vec<u8>,
+    /// `1d` requests sent.
+    pub fetches: u32,
+    /// A `1d` request went unanswered; no more are sent this session.
+    pub unanswered: bool,
+    /// A tap arrived and has not been answered with a fetch yet.
+    pending: bool,
+}
 
 impl Default for Options {
     fn default() -> Self {
@@ -65,6 +98,7 @@ impl Default for Options {
                 .ok()
                 .and_then(|value| value.parse().ok()),
             ack_device_1d: std::env::var("XBOXCTL_NANO_ACK_1D").map_or(true, |value| value != "0"),
+            fetch_telemetry: std::env::var("XBOXCTL_NANO_FETCH_1D").map_or(true, |value| value != "0"),
         }
     }
 }
@@ -124,6 +158,7 @@ pub struct Session<'a, L: Link> {
     /// The device stopped answering (or the transport failed) during a
     /// request; see [`Session::link_lost`].
     lost: bool,
+    telemetry: Telemetry,
 }
 
 impl<'a, L: Link> Session<'a, L> {
@@ -151,6 +186,7 @@ impl<'a, L: Link> Session<'a, L> {
                         seq: Sequence::default(),
                         last_rx: None,
                         lost: false,
+                        telemetry: Telemetry::default(),
                         options,
                     });
                 }
@@ -190,17 +226,66 @@ impl<'a, L: Link> Session<'a, L> {
     /// it arrives, whichever request is waiting (the device resends a frame
     /// until it is acked, also replies that come late), and, with
     /// `ack_device_1d`, those on the device's own channel (handle + 1).
+    /// Notes telemetry taps there for [`Self::fetch_pending_telemetry`].
     fn recv(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, String> {
         let bytes = self.link.recv(timeout)?;
         if let Some(frame) = bytes.as_deref().and_then(Frame::parse) {
             let data = frame.is_fragment() || frame.kind == frame::TYPE_SINGLE;
-            let channel = frame.handle == self.handle
-                || (self.options.ack_device_1d && frame.handle == self.handle.wrapping_add(1));
+            let device_channel = frame.handle == self.handle.wrapping_add(1);
+            let channel = frame.handle == self.handle || (self.options.ack_device_1d && device_channel);
             if data && channel {
                 self.link.send(&frame::ack(frame.handle, frame.opcode, frame.seq))?;
             }
+            if device_channel && frame.opcode == OP_TELEMETRY && frame.kind == frame::TYPE_SINGLE {
+                if frame.payload.is_empty() {
+                    self.telemetry.taps += 1;
+                    self.telemetry.pending = true;
+                } else {
+                    self.telemetry.records += 1;
+                    self.telemetry.last_record = frame.payload.clone();
+                }
+            }
         }
         Ok(bytes)
+    }
+
+    /// After a tap, fetch telemetry the way the SDK does: `1d` requests on
+    /// the session, no payload, until an empty reply. A device that leaves
+    /// one unanswered is not asked again this session, and that alone does
+    /// not count as a lost link: the next real request finds out.
+    fn fetch_pending_telemetry(&mut self) {
+        if !self.telemetry.pending || !self.options.fetch_telemetry || self.telemetry.unanswered {
+            return;
+        }
+        self.telemetry.pending = false;
+        for _ in 0..MAX_TELEMETRY_FETCHES {
+            self.telemetry.fetches += 1;
+            match self.exchange(OP_TELEMETRY, &[], TELEMETRY_TIMEOUT, 1) {
+                Ok(record) if record.is_empty() => break,
+                Ok(record) => {
+                    self.telemetry.records += 1;
+                    self.telemetry.last_record = record;
+                }
+                Err(_) => {
+                    self.telemetry.unanswered = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    /// What the session has seen of the device's telemetry.
+    pub fn telemetry(&self) -> &Telemetry {
+        &self.telemetry
+    }
+
+    /// Keep an idle session serviced: wait up to `timeout` for one device
+    /// frame (acked as usual), then fetch telemetry if the device tapped.
+    /// Returns whether a frame arrived.
+    pub fn pump(&mut self, timeout: Duration) -> Result<bool, String> {
+        let arrived = self.recv(timeout)?.is_some();
+        self.fetch_pending_telemetry();
+        Ok(arrived)
     }
 
     /// Send one message as one or more data frames, waiting for the device's
@@ -279,6 +364,7 @@ impl<'a, L: Link> Session<'a, L> {
         // Every failure here is the link's: an unacked fragment, no reply,
         // or the transport. Malformed or failing replies are judged by the
         // callers and leave `lost` alone.
+        self.fetch_pending_telemetry();
         let result = self.exchange(opcode, payload, timeout, attempts);
         if result.is_err() {
             self.lost = true;
@@ -638,7 +724,7 @@ pub fn resume_after_lost_link<R: Reconnect>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::companion::device::{CompanionEndpoint, FakeNano};
+    use crate::companion::device::{CompanionEndpoint, FakeNano, TelemetryReply};
     use std::collections::VecDeque;
 
     struct MockLink {
@@ -823,7 +909,8 @@ mod tests {
         let mut link = Flood;
         let mut session = Session {
             link: &mut link, handle: 2, version: [2, 0, 13], max_message: 0x1002,
-            seq: Sequence::default(), last_rx: None, lost: false, options: Options { attempts: 1, ..Options::default() },
+            seq: Sequence::default(), last_rx: None, lost: false, telemetry: Telemetry::default(),
+            options: Options { attempts: 1, ..Options::default() },
         };
         assert!(session.request(0x23, &[0; 12], Duration::from_millis(2)).is_err());
     }
@@ -1075,6 +1162,7 @@ mod tests {
         Options {
             finish_flags: None,
             ack_device_1d: false,
+            fetch_telemetry: false,
             ..Options::default()
         }
     }
@@ -1557,6 +1645,117 @@ mod tests {
         assert_eq!(link.endpoint.device.written_data(), &image.data[..]);
         let ack = frame::ack(0x7e, protocol::OP_UPDATE, 0x33);
         assert!(link.sent.contains(&ack), "the late reply was not acked");
+    }
+
+    // Telemetry, as Sean13128 read the SDK on bb441db/xboxctl#18: an empty
+    // `1d` tap on handle + 1 asks the host to fetch records with `1d`
+    // requests until an empty reply. The fake's deadline is a guess at
+    // what ends the link on hardware, so these test the mechanism, not
+    // that it is the cure.
+
+    fn telemetry_options() -> Options {
+        Options { ack_device_1d: true, fetch_telemetry: true, ..clean_options() }
+    }
+
+    fn telemetry_requests(link: &MockLink) -> usize {
+        link.sent
+            .iter()
+            .filter_map(|bytes| Frame::parse(bytes))
+            .filter(|frame| frame.kind == frame::TYPE_SINGLE && frame.handle == 0x7e && frame.opcode == OP_TELEMETRY)
+            .count()
+    }
+
+    fn tapping_retail_link() -> MockLink {
+        let mut link = retail_link();
+        link.endpoint.telemetry_every = Some(500);
+        link.endpoint.telemetry_deadline = Some(2_000);
+        link
+    }
+
+    #[test]
+    fn fetched_telemetry_keeps_a_tapping_device_answering() {
+        let mut link = tapping_retail_link();
+        let image = retail_image(RETAIL_IMAGE_SIZE);
+        let mut session = Session::open(&mut link, 0x1234_5678, telemetry_options()).unwrap();
+        plan(&mut session, LIVE_FEED);
+        session.update(&image, &mut |_| {}).unwrap();
+        let telemetry = session.telemetry().clone();
+        drop(session);
+        assert_eq!(link.endpoint.device.firmware_version, [6, 19, 50, 0]);
+        assert!(telemetry.taps > 0 && !telemetry.unanswered);
+        assert_eq!(telemetry.records, link.endpoint.telemetry_fetched);
+        assert!(telemetry.records >= 80, "{} records", telemetry.records);
+    }
+
+    #[test]
+    fn unfetched_telemetry_ends_the_link_on_the_fake() {
+        let mut link = tapping_retail_link();
+        let image = retail_image(RETAIL_IMAGE_SIZE);
+        let options = Options { fetch_telemetry: false, ..telemetry_options() };
+        let (result, _, lost) = first_attempt(&mut link, &image, options);
+        assert!(result.is_err() && lost);
+        assert_eq!(telemetry_requests(&link), 0);
+    }
+
+    #[test]
+    fn a_device_that_never_answers_a_fetch_is_not_asked_again() {
+        let mut link = retail_link();
+        link.endpoint.telemetry_every = Some(500);
+        link.endpoint.telemetry_reply = TelemetryReply::Silent;
+        let image = retail_image(0x40000);
+        let mut session = Session::open(&mut link, 0x1234_5678, telemetry_options()).unwrap();
+        plan(&mut session, LIVE_FEED);
+        session.update(&image, &mut |_| {}).unwrap();
+        let telemetry = session.telemetry().clone();
+        assert!(!session.link_lost());
+        drop(session);
+        assert!(telemetry.unanswered && telemetry.taps > 1);
+        assert_eq!(telemetry_requests(&link), 1);
+        assert_eq!(link.endpoint.device.firmware_version, [6, 19, 50, 0]);
+    }
+
+    #[test]
+    fn a_device_that_never_runs_dry_is_fetched_a_bounded_number_of_times() {
+        let mut link = retail_link();
+        link.endpoint.telemetry_every = Some(500);
+        link.endpoint.telemetry_reply = TelemetryReply::Endless;
+        let image = retail_image(0x40000);
+        let mut session = Session::open(&mut link, 0x1234_5678, telemetry_options()).unwrap();
+        plan(&mut session, LIVE_FEED);
+        session.update(&image, &mut |_| {}).unwrap();
+        let telemetry = session.telemetry().clone();
+        drop(session);
+        assert_eq!(link.endpoint.device.firmware_version, [6, 19, 50, 0]);
+        assert!(telemetry.fetches > 0);
+        assert!(telemetry.fetches <= telemetry.taps * MAX_TELEMETRY_FETCHES);
+    }
+
+    #[test]
+    fn pump_fetches_after_a_tap_on_an_idle_session() {
+        let mut link = retail_link();
+        link.endpoint.queue_telemetry(3);
+        let mut session = Session::open(&mut link, 0x1234_5678, telemetry_options()).unwrap();
+        // The fake taps on its own once records are queued.
+        assert!(session.pump(Duration::from_millis(1)).unwrap());
+        let telemetry = session.telemetry().clone();
+        drop(session);
+        assert_eq!((telemetry.taps, telemetry.records, telemetry.fetches), (1, 3, 4));
+        assert_eq!(telemetry.last_record.len(), 24);
+        assert!(link.sent.contains(&frame::ack(0x7f, OP_TELEMETRY, 0x40)), "the tap was not acked");
+    }
+
+    #[test]
+    fn telemetry_is_left_alone_when_turned_off() {
+        let mut link = retail_link();
+        link.endpoint.queue_telemetry(3);
+        let options = Options { fetch_telemetry: false, ..telemetry_options() };
+        let mut session = Session::open(&mut link, 0x1234_5678, options).unwrap();
+        // The fake taps on its own once records are queued.
+        session.pump(Duration::from_millis(1)).unwrap();
+        session.device_info().unwrap();
+        assert_eq!(session.telemetry().taps, 1);
+        drop(session);
+        assert_eq!(telemetry_requests(&link), 0);
     }
 
     #[test]

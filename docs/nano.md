@@ -292,11 +292,23 @@ controller returns, without the command being run again. Whether a USB reset
 is enough on the hardware has not been tried. Acks for the `1d` frames are on
 by default; `XBOXCTL_NANO_ACK_1D=0` turns them off.
 
+Sean13128 read in the Accessories SDK (on bb441db/xboxctl#18) that `1d` is
+telemetry: an empty one is a "shoulder tap" saying records are waiting, and
+the service answers it with `1d` requests (no payload, 5 s timeout) on the
+session until a reply comes back empty. `xboxctl` now does the same after
+every tap, before its next request, and stops asking for the session if a
+fetch goes unanswered; `XBOXCTL_NANO_FETCH_1D=0` turns it off. Whether
+unfetched telemetry is what silences the Nano is a guess, tested so far only
+against the simulated device. The hidden `xboxctl nano-hold` command (macOS,
+`--ble <bridge app>` for Bluetooth, `--no-fetch` for the old behaviour) holds
+a read-only session open past four minutes to try it.
+
 ## Open questions
 
 - What keeps a physical Nano's link alive for the length of a full update
-  (see [On a physical Nano](#on-a-physical-nano)), and whether a USB reset
-  revives it like a replug does. A firmware newer than 6.19.50.0, or a
+  (see [On a physical Nano](#on-a-physical-nano)): whether fetching
+  telemetry is enough, and which handle the fetch belongs on (the session's
+  is assumed). Also whether a USB reset revives it like a replug does. A firmware newer than 6.19.50.0, or a
   capture of the Xbox Accessories service updating one, would show it.
 - The meaning of external message `1e 02 05`, and the requests behind battery
   level and the other settings pages.

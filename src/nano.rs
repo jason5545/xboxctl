@@ -371,6 +371,83 @@ fn probe_on<L: crate::companion::updater::Link>(link: &mut L) -> Result<(), Stri
     Ok(())
 }
 
+/// Hold a session open, as an experiment on what keeps a Nano answering:
+/// fetch telemetry when it taps for it (unless `fetch` is off), read the
+/// battery every 15 seconds to see that it still answers, and stop after
+/// `seconds` or the first unanswered read. Read-only throughout.
+#[cfg(target_os = "macos")]
+pub fn hold(ble_bridge: Option<&Path>, seconds: u64, fetch: bool, trace: bool) -> Result<(), String> {
+    use crate::nano_hid::{self, BleLink, HidLink};
+    if let Some(app) = ble_bridge {
+        println!("Bluetooth LE GATT channel via {}", app.display());
+        let mut link = BleLink::launch(app, trace)?;
+        return hold_on(&mut link, seconds, fetch);
+    }
+    let found = nano_hid::find()?;
+    let Some(nano) = found.iter().find(|n| !n.bluetooth) else {
+        return Err("no Nano over USB HID; over Bluetooth use --ble".to_owned());
+    };
+    println!("{}", nano.describe());
+    let mut link = HidLink::open(nano, trace)?;
+    hold_on(&mut link, seconds, fetch)
+}
+
+#[cfg(target_os = "macos")]
+fn hold_on<L: crate::companion::updater::Link>(link: &mut L, seconds: u64, fetch: bool) -> Result<(), String> {
+    use crate::usb::hex;
+    let options = Options { fetch_telemetry: fetch, ..Options::default() };
+    let mut session = Session::open(link, session_id(), options)?;
+    let protocol = session.protocol_version();
+    println!(
+        "Protocol {}.{}.{}; telemetry fetch {}; holding for {seconds} s (the clock starts at the session, not at the connection)",
+        protocol[0],
+        protocol[1],
+        protocol[2],
+        if fetch { "on" } else { "off" }
+    );
+    let start = Instant::now();
+    let limit = Duration::from_secs(seconds);
+    let check_every = Duration::from_secs(15);
+    let mut next_check = Duration::ZERO;
+    let mut seen = (0, 0, 0, false);
+    loop {
+        let elapsed = start.elapsed();
+        let telemetry = session.telemetry();
+        let now = (telemetry.taps, telemetry.fetches, telemetry.records, telemetry.unanswered);
+        if now != seen {
+            println!(
+                "{:>4} s  taps {}  fetches {}  records {}{}",
+                elapsed.as_secs(),
+                now.0,
+                now.1,
+                now.2,
+                if now.3 { "  (a fetch went unanswered; not fetching again)" } else { "" }
+            );
+            if now.2 != seen.2 {
+                println!("        last record ({} bytes): {}", telemetry.last_record.len(), hex(&telemetry.last_record));
+            }
+            seen = now;
+        }
+        if elapsed >= limit {
+            println!("{:>4} s  still answering; done", elapsed.as_secs());
+            return Ok(());
+        }
+        if elapsed >= next_check {
+            match session.query(0x02, &[], Duration::from_secs(5)) {
+                Ok(reply) => println!("{:>4} s  battery {}", elapsed.as_secs(), hex(&reply)),
+                Err(error) => {
+                    return Err(format!(
+                        "stopped answering {} s into the session: {error}",
+                        start.elapsed().as_secs()
+                    ));
+                }
+            }
+            next_check += check_every;
+        }
+        session.pump(Duration::from_millis(200))?;
+    }
+}
+
 /// How long to wait for the device to come back after a USB reset, and for
 /// a replug when one is asked for.
 const RESET_TIMEOUT: Duration = Duration::from_secs(10);

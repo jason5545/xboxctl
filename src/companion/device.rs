@@ -22,6 +22,20 @@ const KEEPALIVE_OPCODE: u8 = 0x1d;
 /// Constant for a whole session on the physical Nano.
 const KEEPALIVE_SEQ: u8 = 0x40;
 
+/// How the fake answers `1d` telemetry requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelemetryReply {
+    /// One queued record per request, then an empty reply.
+    Records,
+    /// Never answers them.
+    Silent,
+    /// Always a record, never the empty reply.
+    Endless,
+}
+
+/// What one fake telemetry record holds; the real layout is not known.
+const TELEMETRY_RECORD: [u8; 24] = [0xa5; 24];
+
 pub struct FakeNano {
     pub vendor_id: u16,
     pub product_id: u16,
@@ -167,6 +181,22 @@ pub struct CompanionEndpoint {
     /// revives a silent device the way a replug does. Not known for the
     /// physical Nano, so tests cover both.
     pub reset_revives: bool,
+    /// Telemetry as Sean13128 read the SDK: queue a record every this many
+    /// host reports and tap for it with an empty `05 <handle+1> 1d <seq> 00`,
+    /// resent until acked; the host fetches records with `1d` requests on
+    /// the session until an empty reply.
+    pub telemetry_every: Option<u32>,
+    /// Go silent once a record has waited this many host reports unfetched:
+    /// one guess at what ends a physical Nano's link after about 3.5
+    /// minutes, not established.
+    pub telemetry_deadline: Option<u32>,
+    pub telemetry_reply: TelemetryReply,
+    telemetry_queued: u32,
+    /// Report count when the oldest unfetched record was queued.
+    telemetry_since: Option<u32>,
+    tap_unacked: bool,
+    /// Records the host fetched.
+    pub telemetry_fetched: u32,
     /// Silent until [`CompanionEndpoint::replug`].
     pub dead: bool,
     /// How many times finish was accepted but the image was discarded.
@@ -192,6 +222,13 @@ impl CompanionEndpoint {
             link_lifetime: None,
             reports: 0,
             reset_revives: true,
+            telemetry_every: None,
+            telemetry_deadline: None,
+            telemetry_reply: TelemetryReply::Records,
+            telemetry_queued: 0,
+            telemetry_since: None,
+            tap_unacked: false,
+            telemetry_fetched: 0,
             dead: false,
             discarded_finishes: 0,
         }
@@ -204,7 +241,17 @@ impl CompanionEndpoint {
         self.pending.clear();
         self.unacked_keepalive = 0;
         self.reports = 0;
+        self.tap_unacked = self.telemetry_queued > 0;
         self.dead = false;
+    }
+
+    /// Queue `count` telemetry records and tap for them.
+    pub fn queue_telemetry(&mut self, count: u32) {
+        if count > 0 {
+            self.telemetry_queued += count;
+            self.telemetry_since.get_or_insert(self.reports);
+            self.tap_unacked = true;
+        }
     }
 
     /// A USB reset from the host: a replug if [`Self::reset_revives`], else
@@ -233,11 +280,24 @@ impl CompanionEndpoint {
             {
                 if frame.seq == KEEPALIVE_SEQ.wrapping_add(1) {
                     self.unacked_keepalive = 0;
+                    self.tap_unacked = false;
                 }
                 return Vec::new();
             }
         }
+        if let (Some(deadline), Some(since)) = (self.telemetry_deadline, self.telemetry_since)
+            && self.reports - since > deadline
+        {
+            self.dead = true;
+            return Vec::new();
+        }
         let mut out = self.handle_protocol(bytes);
+        if self.telemetry_every.is_some_and(|every| self.reports.is_multiple_of(every)) {
+            self.queue_telemetry(1);
+        }
+        if self.tap_unacked {
+            out.push(vec![frame::TYPE_SINGLE, KEEPALIVE_HANDLE, KEEPALIVE_OPCODE, KEEPALIVE_SEQ, 0]);
+        }
         if let Some(limit) = self.keepalive_limit {
             if self.unacked_keepalive >= limit {
                 self.dead = true;
@@ -291,6 +351,19 @@ impl CompanionEndpoint {
                 }
             }
             let response = match frame.opcode {
+                KEEPALIVE_OPCODE => match self.telemetry_reply {
+                    TelemetryReply::Silent => return out,
+                    TelemetryReply::Endless => TELEMETRY_RECORD.to_vec(),
+                    TelemetryReply::Records if self.telemetry_queued > 0 => {
+                        self.telemetry_queued -= 1;
+                        self.telemetry_fetched += 1;
+                        if self.telemetry_queued == 0 {
+                            self.telemetry_since = None;
+                        }
+                        TELEMETRY_RECORD.to_vec()
+                    }
+                    TelemetryReply::Records => Vec::new(),
+                },
                 protocol::OP_DEVICE_INFO => self.device.device_info_response(),
                 protocol::OP_DEVICE_INFO_LEGACY => self.device.device_info_response()[..0x33].to_vec(),
                 protocol::OP_UPDATE => self.device.update_response(&message),
