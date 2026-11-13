@@ -36,7 +36,16 @@ pub struct Options {
     /// (0x180043e50, fed from 0x180019fa0); what bit 1 does on the device is
     /// not known, so this is a knob (`XBOXCTL_NANO_FINISH_FLAGS`), not a rule.
     pub finish_flags: Option<u8>,
+    /// Ack the device's own unsolicited `1d` frames (sent as `05 <handle+1>
+    /// 1d <seq> 00`, repeated with a constant sequence for the whole session).
+    /// A physical Nano stopped answering after about 1,430 unacked repeats
+    /// (about three minutes); whether an ack keeps it alive is untested, so
+    /// this is off unless `XBOXCTL_NANO_ACK_1D=1`.
+    pub ack_device_1d: bool,
 }
+
+/// The device's own unsolicited message opcode seen during a Nano session.
+const OP_DEVICE_1D: u8 = 0x1d;
 
 impl Default for Options {
     fn default() -> Self {
@@ -51,6 +60,7 @@ impl Default for Options {
             finish_flags: std::env::var("XBOXCTL_NANO_FINISH_FLAGS")
                 .ok()
                 .and_then(|value| value.parse().ok()),
+            ack_device_1d: std::env::var("XBOXCTL_NANO_ACK_1D").is_ok_and(|value| value == "1"),
         }
     }
 }
@@ -107,6 +117,33 @@ impl<'a, L: Link> Session<'a, L> {
         Err(format!("device did not accept a session after {attempts} attempts"))
     }
 
+    /// The finish flags override in effect, if any.
+    pub fn finish_flags(&self) -> Option<u8> {
+        self.options.finish_flags
+    }
+
+    /// Set the finish command's flags byte for this session.
+    pub fn set_finish_flags(&mut self, flags: u8) {
+        self.options.finish_flags = Some(flags);
+    }
+
+    /// Next device report. With `ack_device_1d`, also acks the device's own
+    /// unsolicited `1d` frames on handle + 1 before handing the report on.
+    fn recv(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, String> {
+        let bytes = self.link.recv(timeout)?;
+        if self.options.ack_device_1d {
+            if let Some(frame) = bytes.as_deref().and_then(Frame::parse) {
+                if frame.kind == frame::TYPE_SINGLE
+                    && frame.handle == self.handle.wrapping_add(1)
+                    && frame.opcode == OP_DEVICE_1D
+                {
+                    self.link.send(&frame::ack(frame.handle, frame.opcode, frame.seq))?;
+                }
+            }
+        }
+        Ok(bytes)
+    }
+
     /// Send one message as one or more data frames, waiting for the device's
     /// ack after every fragment (stop-and-wait, as the protocol requires). A
     /// message that fits one report needs no ack.
@@ -134,7 +171,7 @@ impl<'a, L: Link> Session<'a, L> {
                     if remaining.is_zero() {
                         break;
                     }
-                    let Some(bytes) = self.link.recv(remaining)? else {
+                    let Some(bytes) = self.recv(remaining)? else {
                         break;
                     };
                     let Some(ack) = Frame::parse(&bytes) else {
@@ -189,7 +226,7 @@ impl<'a, L: Link> Session<'a, L> {
             loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() { break; }
-                let Some(bytes) = self.link.recv(remaining)? else {
+                let Some(bytes) = self.recv(remaining)? else {
                     break;
                 };
                 let Some(frame) = Frame::parse(&bytes) else {
@@ -498,6 +535,24 @@ mod tests {
         assert_eq!(info.hardware_revision, 0x0c06);
         assert_eq!(info.firmware_version, [6, 19, 49, 0]);
         assert!(info.is_updatable());
+    }
+
+    #[test]
+    fn acks_device_1d_frames_only_when_enabled() {
+        for enabled in [false, true] {
+            let mut link = MockLink::new([6, 19, 50, 0]);
+            let options = Options { ack_device_1d: enabled, ..Options::default() };
+            let mut session = Session::open(&mut link, 0x1234_5678, options).unwrap();
+            let device_handle = session.handle.wrapping_add(1);
+            session
+                .link
+                .queue
+                .push_back(vec![frame::TYPE_SINGLE, device_handle, OP_DEVICE_1D, 7, 0]);
+            session.device_info().unwrap();
+            drop(session);
+            let ack = frame::ack(device_handle, OP_DEVICE_1D, 7);
+            assert_eq!(link.sent.iter().any(|p| *p == ack), enabled, "enabled={enabled}");
+        }
     }
 
     #[test]

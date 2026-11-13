@@ -101,6 +101,22 @@ impl Feed {
     }
 }
 
+impl FeedVersion {
+    /// `"6.19.50.0"` as four numbers, compared the way the SDK does (plain `<`).
+    pub fn parts(&self) -> Option<[u16; 4]> {
+        let mut parts = self.version.split('.').map(|part| part.parse::<u16>().ok());
+        let out = [parts.next()??, parts.next()??, parts.next()??, parts.next()??];
+        parts.next().is_none().then_some(out)
+    }
+}
+
+impl FeedDevice {
+    /// The highest `req` version of this entry, if it lists one.
+    pub fn required_version(&self) -> Option<[u16; 4]> {
+        self.required.iter().filter_map(FeedVersion::parts).max()
+    }
+}
+
 impl FeedFile {
     /// Firmware version from the file name (`..._v_5_23_6_0_h_...`).
     pub fn version(&self) -> Option<String> {
@@ -290,6 +306,7 @@ mod tests {
         let device = feed.device(0x045e, 0x0b12).unwrap();
         assert_eq!(device.codename, "merl");
         assert_eq!(device.required[0].version, "5.9.2709.0");
+        assert_eq!(device.required_version(), Some([5, 9, 2709, 0]));
         let file = &device.files[0];
         assert_eq!(file.version().as_deref(), Some("5.23.6.0"));
         assert_eq!(

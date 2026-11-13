@@ -63,11 +63,17 @@ pub fn status(nano: &NanoDevice, trace: bool) -> Result<(), String> {
 /// device's hardware revision from Microsoft's flight feed (see
 /// `feed::NANO_FEED_URL`; it is not the feed the Xbox Accessories app's own
 /// update check uses, and has not been checked against physical hardware).
-fn load_image(image_path: Option<&Path>, info: &DeviceInfo) -> Result<Image, String> {
+///
+/// Also returns the feed entry's `req` version, which decides the finish
+/// flags (see [`finish_flags_for`]); a local file has none.
+fn load_image(
+    image_path: Option<&Path>,
+    info: &DeviceInfo,
+) -> Result<(Image, Option<[u16; 4]>), String> {
     if let Some(path) = image_path {
         let bytes = fs::read(path)
             .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-        return Image::parse(&bytes);
+        return Ok((Image::parse(&bytes)?, None));
     }
     let feed = feed::fetch_nano_feed()?;
     let entry = feed
@@ -92,7 +98,16 @@ fn load_image(image_path: Option<&Path>, info: &DeviceInfo) -> Result<Image, Str
         file.tag
     );
     println!("{}", path.display());
-    Ok(image)
+    Ok((image, entry.required_version()))
+}
+
+/// Finish flags the SDK would send: `3` when the device runs firmware below
+/// the feed entry's `req` version, otherwise the plain foreground flag (`1`,
+/// left to `protocol::finish_request`). A physical Nano on 6.9.444.0 with
+/// `req` 6.19.50.0 discarded the image after finish flags `1` and applied it
+/// after `3`.
+fn finish_flags_for(running: [u16; 4], required: Option<[u16; 4]>) -> Option<u8> {
+    required.filter(|required| running < *required).map(|_| 3)
 }
 
 pub fn update(
@@ -110,7 +125,20 @@ pub fn update(
         return Err("the device does not report itself as updatable".to_owned());
     }
 
-    let image = load_image(image_path, &info)?;
+    let (image, required) = load_image(image_path, &info)?;
+    if session.finish_flags().is_none() {
+        if let Some(flags) = finish_flags_for(info.firmware_version, required) {
+            session.set_finish_flags(flags);
+        }
+    }
+    match (session.finish_flags(), required) {
+        (Some(flags), Some(required)) if finish_flags_for(info.firmware_version, Some(required)).is_some() => println!(
+            "Finish flags      {flags} (firmware is below the feed's required {})",
+            version(required)
+        ),
+        (Some(flags), _) => println!("Finish flags      {flags} (XBOXCTL_NANO_FINISH_FLAGS)"),
+        (None, _) => println!("Finish flags      1 (default)"),
+    }
     println!(
         "Image: firmware {} ({:#x} bytes)",
         image.version_string(),
@@ -250,5 +278,22 @@ fn wait_for_restart(nano: &NanoDevice) -> Option<NanoDevice> {
             return None;
         }
         thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::finish_flags_for;
+
+    #[test]
+    fn finishes_with_flags_3_below_the_required_version() {
+        assert_eq!(finish_flags_for([6, 9, 444, 0], Some([6, 19, 50, 0])), Some(3));
+    }
+
+    #[test]
+    fn default_finish_at_or_above_the_required_version_or_without_one() {
+        assert_eq!(finish_flags_for([6, 19, 50, 0], Some([6, 19, 50, 0])), None);
+        assert_eq!(finish_flags_for([6, 20, 0, 0], Some([6, 19, 50, 0])), None);
+        assert_eq!(finish_flags_for([6, 9, 444, 0], None), None);
     }
 }
