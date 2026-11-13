@@ -6,6 +6,11 @@
 //! flag bytes) are left as documented there.
 
 pub const OP_DEVICE_INFO: u8 = 0x2e;
+pub const OP_DEVICE_INFO_LEGACY: u8 = 0x23;
+
+pub fn device_info_opcode(version: [u8; 3]) -> u8 {
+    if version < [2, 0, 22] { OP_DEVICE_INFO_LEGACY } else { OP_DEVICE_INFO }
+}
 pub const OP_UPDATE: u8 = 0x03;
 
 pub const SUB_STATUS: u8 = 0x14;
@@ -20,8 +25,18 @@ const STATUS_MIN: usize = 34;
 
 /// `2e` request: a timestamp (unused by us) and a fixed trailing word.
 pub fn device_info_request() -> Vec<u8> {
-    let mut out = vec![0u8; 12];
-    out.extend_from_slice(&0x3bu32.to_le_bytes());
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    device_info_request_at(timestamp)
+}
+
+fn device_info_request_at(timestamp: u64) -> Vec<u8> {
+    let mut out = timestamp.to_le_bytes().to_vec();
+    // Microsoft's service SDK OnCompanionServerAdded serializer sends 6,
+    // not the expected reply size documented in the original branch notes.
+    out.extend_from_slice(&6u32.to_le_bytes());
     out
 }
 
@@ -38,6 +53,18 @@ pub struct DeviceInfo {
 pub const CAP_UPDATABLE: u32 = 1 << 2;
 
 impl DeviceInfo {
+    pub fn parse_legacy(payload: &[u8]) -> Option<Self> {
+        if payload.len() < 0x33 { return None; }
+        Some(Self {
+            vendor_id: u16::from_le_bytes([payload[0], payload[1]]),
+            product_id: u16::from_le_bytes([payload[2], payload[3]]),
+            hardware_revision: u16::from_le_bytes([payload[4], payload[5]]),
+            capabilities: u32::from_le_bytes(payload[0x29..0x2d].try_into().unwrap()),
+            // hello5 omits the version; updatable devices supply it through
+            // the separate read-only firmware-status request.
+            firmware_version: [0; 4],
+        })
+    }
     pub fn parse(payload: &[u8]) -> Option<Self> {
         if payload.len() < DEVICE_INFO_MIN {
             return None;
@@ -101,6 +128,9 @@ pub struct UpdateStatus {
     /// instead of `11`), not implemented here.
     pub mode: u8,
     pub max_chunk: u16,
+    /// Bytes of the pending image the device holds (offset 60); absent in
+    /// short replies.
+    pub bytes_written: Option<u32>,
 }
 
 impl UpdateStatus {
@@ -117,6 +147,9 @@ impl UpdateStatus {
             flags: payload[26],
             mode: payload[27],
             max_chunk: u16::from_le_bytes([payload[32], payload[33]]),
+            bytes_written: payload
+                .get(60..64)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap())),
         })
     }
 }
@@ -180,6 +213,11 @@ pub struct WriteReply {
 }
 
 impl WriteReply {
+    /// The SDK requires the flags byte from Companion Protocol 2.0.8 onward.
+    pub fn parse_for_version(payload: &[u8], version: [u8; 3]) -> Option<Self> {
+        if version >= [2, 0, 8] && payload.len() < 3 { return None; }
+        Self::parse(payload)
+    }
     pub fn parse(payload: &[u8]) -> Option<Self> {
         if payload.len() < 2 || payload[0] != SUB_WRITE {
             return None;
@@ -210,6 +248,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn write_reply_flags_are_required_for_retail_nano_protocol() {
+        assert!(WriteReply::parse_for_version(&[SUB_WRITE, 0], [2, 0, 7]).is_some());
+        assert!(WriteReply::parse_for_version(&[SUB_WRITE, 0], [2, 0, 8]).is_none());
+        assert!(WriteReply::parse_for_version(&[SUB_WRITE, 0], [2, 0, 13]).is_none());
+        assert_eq!(WriteReply::parse_for_version(&[SUB_WRITE, 0, 1], [2, 0, 13]).unwrap().flags, 1);
+    }
+
+    #[test]
+    fn device_info_request_matches_sdk_timestamp_and_trailing_value() {
+        let request = device_info_request_at(0x0807_0605_0403_0201);
+        assert_eq!(request, [1, 2, 3, 4, 5, 6, 7, 8, 6, 0, 0, 0]);
+    }
+
+    #[test]
+    fn selects_hello5_for_the_physical_nanos_protocol_version() {
+        assert_eq!(device_info_opcode([2, 0, 13]), 0x23);
+        assert_eq!(device_info_opcode([2, 0, 21]), 0x23);
+        assert_eq!(device_info_opcode([2, 0, 22]), 0x2e);
+        assert_eq!(device_info_opcode([2, 1, 0]), 0x2e);
+    }
+
+    #[test]
+    fn legacy_info_does_not_read_nonexistent_firmware_field() {
+        let mut data = vec![0; 0x33];
+        data[..6].copy_from_slice(&[0x5e, 4, 0x4e, 0x0b, 6, 0x0c]);
+        data[0x29] = 4;
+        let info = DeviceInfo::parse_legacy(&data).unwrap();
+        assert_eq!((info.vendor_id, info.product_id, info.hardware_revision), (0x045e, 0x0b4e, 0x0c06));
+        assert!(info.is_updatable());
+        assert_eq!(info.firmware_version, [0; 4]);
+        assert!(DeviceInfo::parse_legacy(&data[..0x32]).is_none());
+    }
+
+    #[test]
     fn parses_device_info() {
         let mut payload = vec![0u8; 0x4e];
         payload[0..2].copy_from_slice(&0x0b4cu16.to_le_bytes());
@@ -235,6 +307,7 @@ mod tests {
         assert_eq!(status.token, [0xaa; 16]);
         assert_eq!(status.running_version, [6, 19, 49, 0]);
         assert_eq!(status.max_chunk, 0x0800);
+        assert_eq!(status.bytes_written, None);
     }
 
     #[test]

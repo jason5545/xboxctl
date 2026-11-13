@@ -681,6 +681,15 @@ pub struct NanoLink {
 
 impl NanoLink {
     pub fn open(device: &NanoDevice, trace: bool) -> Result<Self, String> {
+        if trace {
+            eprintln!("HID interface {}, IN {:#04x}/{} bytes, OUT {:#04x}/{} bytes",
+                device.interface, device.endpoint_in.0, device.endpoint_in.1,
+                device.endpoint_out.0, device.endpoint_out.1);
+            let other = holders::find(device.vendor_id, device.product_id, device.bus, device.address);
+            if !other.is_empty() {
+                eprintln!("Warning: {}", holders::sentence(&other));
+            }
+        }
         let handle = device.device.open().map_err(|error| match error {
             rusb::Error::Access => {
                 access_error(&device.location(), device.vendor_id, device.product_id)
@@ -708,6 +717,7 @@ impl NanoLink {
                 .name("nano-in".to_owned())
                 .spawn(move || {
                     let mut buffer = vec![0u8; endpoint_in.1];
+                    let mut traced_other = 0;
                     while !stop.load(Ordering::Relaxed) {
                         let result = match handle.read_interrupt(
                             endpoint_in.0,
@@ -723,7 +733,13 @@ impl NanoLink {
                             {
                                 Ok(buffer[1..length].to_vec())
                             }
-                            Ok(_) => continue,
+                            Ok(length) => {
+                                if trace && length > 0 && traced_other < 8 {
+                                    eprintln!("HID discarded ({length}/{} bytes): {}", endpoint_in.1, hex(&buffer[..length]));
+                                    traced_other += 1;
+                                }
+                                continue;
+                            }
                             Err(rusb::Error::Timeout) => continue,
                             Err(rusb::Error::NoDevice) => Err("device disconnected".to_owned()),
                             Err(error) => Err(format!("USB read failed: {error}")),

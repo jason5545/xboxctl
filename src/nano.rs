@@ -173,22 +173,29 @@ pub fn update(
     println!("Waiting for the device to restart...");
     match wait_for_restart(nano) {
         Some(restarted) => match query_after_restart(&restarted, trace) {
-            Ok(info) => println!(
-                "Device is back, now running firmware {}",
-                version(info.firmware_version)
-            ),
-            Err(error) => println!(
-                "The device came back, but did not answer: {error}. If it stays unresponsive, \
-                 unplug it and plug it back in."
-            ),
+            Ok(info) if info.firmware_version == image.version => {
+                println!(
+                    "Device is back, now running firmware {}",
+                    version(info.firmware_version)
+                );
+                Ok(())
+            }
+            Ok(info) => Err(format!(
+                "the device came back running {}, not {}; the update did not take",
+                version(info.firmware_version),
+                image.version_string()
+            )),
+            Err(error) => Err(format!(
+                "the device came back but did not answer ({error}), so the update is \
+                 unverified. Unplug it, plug it back in and run `info`."
+            )),
         },
-        None => println!(
-            "Update finished, but the device did not come back within {} s. If it stays \
-             disconnected, unplug it and plug it back in.",
+        None => Err(format!(
+            "the device did not come back within {} s, so the update is unverified. \
+             Unplug it, plug it back in and run `info`.",
             RESTART_TIMEOUT.as_secs()
-        ),
+        )),
     }
-    Ok(())
 }
 
 /// Re-enumeration can briefly race the device finishing its own boot: the

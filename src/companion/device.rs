@@ -25,6 +25,9 @@ pub struct FakeNano {
     token: [u8; 16],
     slot: u8,
     written: Vec<u8>,
+    /// Test knobs: under-report the written count; flags byte of write replies.
+    pub lose_bytes: u32,
+    pub write_flags: u8,
 }
 
 impl FakeNano {
@@ -38,6 +41,8 @@ impl FakeNano {
             token: *b"fake-nano-token!",
             slot: 0,
             written: Vec::new(),
+            lose_bytes: 0,
+            write_flags: 0,
         }
     }
 
@@ -60,13 +65,16 @@ impl FakeNano {
     fn update_response(&mut self, payload: &[u8]) -> Vec<u8> {
         match payload.first().copied() {
             Some(protocol::SUB_STATUS) => {
-                let mut out = vec![0u8; 34];
+                // 80 bytes, as a physical Nano answers.
+                let mut out = vec![0u8; 80];
                 out[0] = protocol::SUB_STATUS;
                 out[2..18].copy_from_slice(&self.token);
                 for (i, word) in self.firmware_version.iter().enumerate() {
                     out[18 + i * 2..18 + i * 2 + 2].copy_from_slice(&word.to_le_bytes());
                 }
                 out[32..34].copy_from_slice(&self.max_chunk.to_le_bytes());
+                let written = (self.written.len() as u32).saturating_sub(self.lose_bytes);
+                out[60..64].copy_from_slice(&written.to_le_bytes());
                 out
             }
             Some(protocol::SUB_START) if payload.len() >= 27 => {
@@ -81,7 +89,7 @@ impl FakeNano {
                     self.written.resize(end, 0);
                 }
                 self.written[offset..end].copy_from_slice(data);
-                vec![protocol::SUB_WRITE, 0]
+                vec![protocol::SUB_WRITE, 0, self.write_flags]
             }
             Some(protocol::SUB_FINISH) => {
                 // The new version travelled in the start request; a real
@@ -145,6 +153,7 @@ impl CompanionEndpoint {
             }
             let response = match frame.opcode {
                 protocol::OP_DEVICE_INFO => self.device.device_info_response(),
+                protocol::OP_DEVICE_INFO_LEGACY => self.device.device_info_response()[..0x33].to_vec(),
                 protocol::OP_UPDATE => self.device.update_response(&message),
                 _ => vec![frame.opcode, 13],
             };
@@ -167,8 +176,12 @@ impl CompanionEndpoint {
     /// Queue `payload` as one or more outgoing frames, returning the first
     /// and keeping the rest for release as the host acks them.
     fn queue_response(&mut self, opcode: u8, payload: &[u8]) -> Vec<Vec<u8>> {
-        let mut frames =
-            frame::fragments(HANDLE, opcode, &mut self.device_seq, payload, FRAGMENT_DATA);
+        // As a physical Nano numbers them: fragments count up from the
+        // message's first sequence, and the next message starts one after
+        // this one started, so consecutive replies overlap.
+        let mut seq = self.device_seq;
+        self.device_seq.take();
+        let mut frames = frame::fragments(HANDLE, opcode, &mut seq, payload, FRAGMENT_DATA);
         let first = frames.remove(0);
         self.pending = frames.into();
         vec![first]
