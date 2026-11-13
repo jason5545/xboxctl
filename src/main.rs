@@ -8,6 +8,8 @@ mod holders;
 mod iokit;
 mod live;
 mod nano;
+#[cfg(target_os = "macos")]
+mod nano_hid;
 mod progress;
 #[cfg(unix)]
 mod sys;
@@ -61,6 +63,15 @@ enum Command {
         /// Device to use, as BUS:ADDRESS from `xboxctl list`.
         #[arg(long)]
         device: Option<String>,
+    },
+    /// Read a Nano's settings over macOS HID (Bluetooth or USB) with
+    /// read-only requests, printing the raw replies. Changes nothing.
+    #[cfg(target_os = "macos")]
+    #[command(hide = true)]
+    NanoProbe {
+        /// Use the Bluetooth LE GATT channel through this nano-ble-bridge app.
+        #[arg(long)]
+        ble: Option<PathBuf>,
     },
     /// Download the current firmware for a GIP controller from Microsoft's
     /// firmware feed (the one the Xbox Accessories app uses).
@@ -168,6 +179,13 @@ fn main() {
     match cli.command {
         Command::List => {
             if let Err(error) = list() {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+        #[cfg(target_os = "macos")]
+        Command::NanoProbe { ble } => {
+            if let Err(error) = nano::probe(ble.as_deref(), trace_packets) {
                 eprintln!("{error}");
                 std::process::exit(1);
             }

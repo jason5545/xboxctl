@@ -347,6 +347,18 @@ impl<'a, L: Link> Session<'a, L> {
         ))
     }
 
+    /// The protocol version the device negotiated.
+    pub fn protocol_version(&self) -> [u8; 3] {
+        self.version
+    }
+
+    /// One read-only request and its reassembled reply, sent once: for
+    /// probing requests whose meaning is still being worked out. Never use it
+    /// for a request that changes the device.
+    pub fn query(&mut self, opcode: u8, payload: &[u8], timeout: Duration) -> Result<Vec<u8>, String> {
+        self.request_with_attempts(opcode, payload, timeout, 1)
+    }
+
     pub fn device_info(&mut self) -> Result<DeviceInfo, String> {
         let opcode = protocol::device_info_opcode(self.version);
         let response = self.request(

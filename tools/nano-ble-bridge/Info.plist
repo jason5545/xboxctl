@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>io.github.xboxctl.nano-ble-bridge</string>
+<key>CFBundleName</key><string>nano-ble</string>
+<key>CFBundleExecutable</key><string>nano-ble</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>LSUIElement</key><true/>
+<key>NSBluetoothAlwaysUsageDescription</key><string>Talk to the Xbox Nano Controller over its Bluetooth LE companion channel.</string>
+</dict></plist>

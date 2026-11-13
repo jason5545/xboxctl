@@ -21,4 +21,5 @@ libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10.1"
+hidapi = { version = "2.6", default-features = false, features = ["macos-shared-device"] }
 io-kit-sys = "0.5.0"

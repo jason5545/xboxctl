@@ -43,7 +43,7 @@ fn session_id() -> u32 {
     nanos ^ std::process::id()
 }
 
-fn open_session(link: &mut NanoLink) -> Result<Session<'_, NanoLink>, String> {
+fn open_session<L: crate::companion::updater::Link>(link: &mut L) -> Result<Session<'_, L>, String> {
     Session::open(link, session_id(), Options::default())
 }
 
@@ -303,6 +303,69 @@ pub fn update(
             RESTART_TIMEOUT.as_secs()
         )),
     }
+}
+
+/// Read-only probes from `docs/nano-settings.md` ("Safe to try first"),
+/// sent over macOS HID so they work over Bluetooth too. Prints raw replies;
+/// interpreting them is the point of running it.
+#[cfg(target_os = "macos")]
+pub fn probe(ble_bridge: Option<&Path>, trace: bool) -> Result<(), String> {
+    use crate::nano_hid::{self, BleLink, HidLink};
+    if let Some(app) = ble_bridge {
+        println!("Bluetooth LE GATT channel via {}", app.display());
+        let mut link = BleLink::launch(app, trace)?;
+        return probe_on(&mut link);
+    }
+    let found = nano_hid::find()?;
+    // macOS refuses output report 0x0c over Bluetooth LE (IOHIDDeviceSetReport
+    // returns kIOReturnNotFound, while the rumble report 3 goes through), so
+    // prefer USB when both are there; over Bluetooth use --ble instead.
+    let Some(nano) = found.iter().find(|n| !n.bluetooth).or(found.first()) else {
+        return Err("no Nano companion collection found over HID (Bluetooth or USB)".to_owned());
+    };
+    println!("{}", nano.describe());
+    let mut link = HidLink::open(nano, trace)?;
+    probe_on(&mut link)
+}
+
+#[cfg(target_os = "macos")]
+fn probe_on<L: crate::companion::updater::Link>(link: &mut L) -> Result<(), String> {
+    use crate::usb::hex;
+    let mut session = open_session(link)?;
+    let protocol = session.protocol_version();
+    println!("Protocol          {}.{}.{}", protocol[0], protocol[1], protocol[2]);
+
+    let timeout = Duration::from_secs(5);
+    let info_opcode = crate::companion::protocol::device_info_opcode(protocol);
+    match session.query(info_opcode, &crate::companion::protocol::device_info_request(), timeout) {
+        Ok(reply) => {
+            println!("Device info {info_opcode:#04x} ({} bytes): {}", reply.len(), hex(&reply));
+            if reply.len() >= 0x33 {
+                let capabilities = u32::from_le_bytes(reply[0x29..0x2d].try_into().unwrap());
+                let components = u32::from_le_bytes(reply[0x2d..0x31].try_into().unwrap());
+                println!("  capabilities    {capabilities:#010x}");
+                println!("  ext. components {components:#010x} (+ u16 {:#06x})", u16::from_le_bytes([reply[0x31], reply[0x32]]));
+            }
+        }
+        Err(error) => println!("Device info {info_opcode:#04x}: {error}"),
+    }
+
+    let probes: [(&str, u8, &[u8]); 7] = [
+        ("battery            02", 0x02, &[]),
+        ("get active mode    1e 0d 03", 0x1e, &[0x0d, 0x03]),
+        ("get mapping 00     1e 0d 08 00", 0x1e, &[0x0d, 0x08, 0x00]),
+        ("get mapping 01     1e 0d 08 01", 0x1e, &[0x0d, 0x08, 0x01]),
+        ("get mapping 10     1e 0d 08 10", 0x1e, &[0x0d, 0x08, 0x10]),
+        ("get friendly name  1e 0d 05", 0x1e, &[0x0d, 0x05]),
+        ("external 02 05     1e 02 05", 0x1e, &[0x02, 0x05]),
+    ];
+    for (label, opcode, payload) in probes {
+        match session.query(opcode, payload, timeout) {
+            Ok(reply) => println!("{label}: {} bytes: {}", reply.len(), hex(&reply)),
+            Err(error) => println!("{label}: {error}"),
+        }
+    }
+    Ok(())
 }
 
 /// How long to wait for the device to come back after a USB reset, and for
