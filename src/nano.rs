@@ -350,14 +350,17 @@ fn probe_on<L: crate::companion::updater::Link>(link: &mut L) -> Result<(), Stri
         Err(error) => println!("Device info {info_opcode:#04x}: {error}"),
     }
 
+    // The app's V2 settings messages go out with message ID 02 (their
+    // constructors set it; 0d is only the fallback), see
+    // docs/nano-settings.md. All of these only read.
     let probes: [(&str, u8, &[u8]); 7] = [
         ("battery            02", 0x02, &[]),
-        ("get active mode    1e 0d 03", 0x1e, &[0x0d, 0x03]),
-        ("get mapping 00     1e 0d 08 00", 0x1e, &[0x0d, 0x08, 0x00]),
-        ("get mapping 01     1e 0d 08 01", 0x1e, &[0x0d, 0x08, 0x01]),
-        ("get mapping 10     1e 0d 08 10", 0x1e, &[0x0d, 0x08, 0x10]),
-        ("get friendly name  1e 0d 05", 0x1e, &[0x0d, 0x05]),
-        ("external 02 05     1e 02 05", 0x1e, &[0x02, 0x05]),
+        ("get active mode    1e 02 03", 0x1e, &[0x02, 0x03]),
+        ("get mapping 00     1e 02 08 00", 0x1e, &[0x02, 0x08, 0x00]),
+        ("get mapping 01     1e 02 08 01", 0x1e, &[0x02, 0x08, 0x01]),
+        ("get mapping 10     1e 02 08 10", 0x1e, &[0x02, 0x08, 0x10]),
+        ("get mapping 11     1e 02 08 11", 0x1e, &[0x02, 0x08, 0x11]),
+        ("get friendly name  1e 02 05", 0x1e, &[0x02, 0x05]),
     ];
     for (label, opcode, payload) in probes {
         match session.query(opcode, payload, timeout) {
