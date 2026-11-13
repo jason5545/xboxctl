@@ -84,8 +84,8 @@ enum Command {
         /// Firmware package (rdhm for a GIP controller, PPAS for a Nano).
         #[arg(required_unless_present = "latest")]
         image: Option<PathBuf>,
-        /// Download the current firmware from Microsoft's feed and install
-        /// it. GIP controllers only.
+        /// Download the current firmware from Microsoft's feed (the flight
+        /// feed for a Nano) and install it.
         #[arg(long, conflicts_with = "image")]
         latest: bool,
         /// Device to update, as BUS:ADDRESS from `xboxctl list`.

@@ -26,8 +26,9 @@ xboxctl update <image.bin>   # a PPAS firmware image
 ```
 
 This has been checked against an emulated Nano in QEMU over a real USB HID
-connection, including a full firmware update (session, device info, and the
-write/finish sequence) — **not yet against a physical Nano**; see
+connection, and retail Nanos have been updated with it on macOS from
+6.9.444.0 to 6.19.50.0, though not yet in one go: see
+[On a physical Nano](#on-a-physical-nano) and
 [Open questions](#open-questions).
 
 The rest of this page is reverse engineering notes on the protocol itself and
@@ -264,15 +265,39 @@ Microsoft's own updater is this same Companion Protocol sequence, driven by a
 service that a `0b4e` device's arrival starts, not logic private to the
 service or to Windows.
 
+## On a physical Nano
+
+Retail Nanos (`045e:0b4e`, hardware revision `0c06`, 6.9.444.0, protocol
+2.0.13) have been updated to 6.19.50.0 on Apple Silicon Macs. They report
+64-byte HID reports, answer the legacy `23` device information below protocol
+2.0.22, resend every frame (replies too) until it is acked, need finish flags
+`3` below the feed's `req` version, and resume a transfer across sessions.
+
+The one thing that has not worked is a single uninterrupted run. While a
+session is open the device sends `05 <handle+1> 1d <seq> 00`, repeating it with
+a constant sequence until it is acked. Left unacked, the controller stopped
+answering after about 1,430 repeats (about three and a half minutes); with
+every repeat acked it still stopped, 3m46s after it was plugged in, at 75% of
+the image. The full image takes longer than that to write, at about 10 KB/s.
+Once silent it answers nothing, not even a new session, until it is
+replugged, and the transfer then resumes where it stopped. Microsoft's
+updater does not need a replug, so something keeps the link alive that is not
+known yet (an answer to `1d` rather than an ack is one guess).
+
+Until that is known, `xboxctl update` carries on by itself when the link
+drops: it resets the controller's USB connection, opens a new session, checks
+it is the same device and writes on from the resume offset. If the reset
+does not bring it back, it asks for a replug and continues once the
+controller returns, without the command being run again. Whether a USB reset
+is enough on the hardware has not been tried. Acks for the `1d` frames are on
+by default; `XBOXCTL_NANO_ACK_1D=0` turns them off.
+
 ## Open questions
 
-- Whether a physical Nano matches all of this, including its report sizes.
-  This is the main thing `xboxctl` itself has not been checked against: only
-  the emulated Nano, over a real USB HID connection, not just the in-process
-  mock its tests use. Relatedly, whether a physical Nano accepts an update
-  driven this way at all — on the emulated Nano, the same foreground sequence
-  the SDK runs on its own (without `XboxAccessoriesService`) is what `xboxctl`
-  uses, and both have updated it successfully.
+- What keeps a physical Nano's link alive for the length of a full update
+  (see [On a physical Nano](#on-a-physical-nano)), and whether a USB reset
+  revives it like a replug does. A firmware newer than 6.19.50.0, or a
+  capture of the Xbox Accessories service updating one, would show it.
 - The meaning of external message `1e 02 05`, and the requests behind battery
   level and the other settings pages.
 

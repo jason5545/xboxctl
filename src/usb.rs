@@ -666,6 +666,22 @@ pub fn reject_nano(location: Option<&str>, command: &str) -> Result<(), String> 
     }
 }
 
+/// A USB reset of a Pendragon accessory, the host's stand-in for unplugging
+/// it: the device drops off the bus and enumerates again, possibly under a
+/// new address. Whether it revives a physical Nano that stopped answering
+/// mid-update is not known yet; `nano::update` asks for a replug when it
+/// does not. "Not found" afterwards is the re-enumeration, not a failure.
+pub fn reset_nano(device: &NanoDevice) -> Result<(), String> {
+    let handle = device
+        .device
+        .open()
+        .map_err(|error| format!("could not open {} to reset it: {error}", device.location()))?;
+    match handle.reset() {
+        Ok(()) | Err(rusb::Error::NotFound) | Err(rusb::Error::NoDevice) => Ok(()),
+        Err(error) => Err(format!("USB reset of {} failed: {error}", device.location())),
+    }
+}
+
 /// Interrupt endpoints of a Pendragon accessory's HID interface, framed as
 /// `0x0c` reports, with a reader thread that keeps an IN transfer pending.
 pub struct NanoLink {

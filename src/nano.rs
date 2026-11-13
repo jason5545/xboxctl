@@ -9,11 +9,15 @@
 use crate::companion::{
     firmware::Image,
     protocol::DeviceInfo,
-    updater::{finish_flags_for, Event, FinishFlags, Options, Session},
+    updater::{
+        finish_flags_for, resume_after_lost_link, Event, Expected, FinishFlags, Options, Reconnect,
+        Session,
+    },
 };
 use crate::feed;
 use crate::usb::{self, NanoDevice, NanoLink};
 use std::{
+    cell::Cell,
     fs,
     io::{self, BufRead, Write},
     path::Path,
@@ -120,15 +124,17 @@ pub fn update(
     yes: bool,
     trace: bool,
 ) -> Result<(), String> {
-    // Read the device, then close the session before downloading and
-    // asking for confirmation: an open session that nobody reads piles up
-    // the device's unacked 1d frames, and a physical Nano dropped the link
-    // after about three minutes of them.
-    let info = {
-        let mut link = NanoLink::open(nano, trace)?;
-        let mut session = open_session(&mut link)?;
-        session.device_info()?
-    };
+    // One session from the first read to the write, so the device is read
+    // and written within as little of its link's life as possible: a
+    // physical retail Nano (6.9.444.0) stopped answering about three and a
+    // half minutes after it was plugged in, acks or not, until it was
+    // replugged. Frames that arrive while the image downloads or the prompt
+    // waits queue up and are acked by the recheck below. If the link drops
+    // anyway, before or during the write, `resume_after_lost_link` brings
+    // the device back and carries on from where it stopped.
+    let mut link = NanoLink::open(nano, trace)?;
+    let mut session = open_session(&mut link)?;
+    let info = session.device_info()?;
     print_device_info(&info);
     if !info.is_updatable() {
         return Err("the device does not report itself as updatable".to_owned());
@@ -157,9 +163,9 @@ pub fn update(
     println!(
         "1d acks           {}",
         if options.ack_device_1d {
-            "on (XBOXCTL_NANO_ACK_1D=1)"
+            "on"
         } else {
-            "off"
+            "off (XBOXCTL_NANO_ACK_1D=0)"
         }
     );
     if dry_run {
@@ -189,32 +195,26 @@ pub fn update(
         }
     }
 
-    // A fresh session for the write, checked against what was shown above.
-    let mut link = NanoLink::open(nano, trace)?;
-    let mut session = open_session(&mut link)?;
-    let now = session.device_info()?;
-    if now.hardware_revision != info.hardware_revision || now.firmware_version != info.firmware_version {
-        return Err(format!(
-            "the device changed since it was read (hardware {:#06x}, firmware {} -> {:#06x}, {}); \
-             not writing. Run the command again.",
-            info.hardware_revision,
-            version(info.firmware_version),
-            now.hardware_revision,
-            version(now.firmware_version)
-        ));
-    }
-    let chosen = session.choose_finish_flags(now.firmware_version, required);
-    if chosen != planned {
-        return Err(format!(
-            "finish flags changed between the check and the write ({} -> {}); not writing",
-            describe_finish_flags(planned),
-            describe_finish_flags(chosen)
-        ));
-    }
+    // A session opened after a lost link must finish with the same flags.
+    let mut resume_options = options.clone();
+    resume_options.finish_flags = match planned {
+        FinishFlags::Override(flags) | FinishFlags::Required { flags, .. } => Some(flags),
+        FinishFlags::Default => None,
+    };
+    let expected = Expected {
+        hardware_revision: info.hardware_revision,
+        firmware_version: info.firmware_version,
+    };
 
+    // Set when a reconnected device turns out to run the new firmware
+    // already: the finish went through before the link dropped.
+    let up_to_date = Cell::new(false);
     let mut line = crate::progress::ProgressLine::new();
-    let mut report = move |event: &Event| match event {
-        Event::UpToDate => line.finish("Already up to date."),
+    let mut report = |event: &Event| match event {
+        Event::UpToDate => {
+            up_to_date.set(true);
+            line.finish("The device already runs the new firmware.")
+        }
         Event::Begin {
             resume_offset,
             total,
@@ -230,10 +230,52 @@ pub fn update(
             line.finish("Finished. The device restarts itself into the new firmware.")
         }
     };
-    session.update(&image, &mut report)?;
+    // Same session, read again: the device must still answer and be the one
+    // shown above. A device that stopped answering here (a slow download or
+    // prompt) has nothing written yet and goes the lost-link way below.
+    let first = match session.device_info() {
+        Ok(now) => {
+            if now.hardware_revision != info.hardware_revision
+                || now.firmware_version != info.firmware_version
+            {
+                return Err(format!(
+                    "the device changed since it was read (hardware {:#06x}, firmware {} -> {:#06x}, {}); \
+                     not writing. Run the command again.",
+                    info.hardware_revision,
+                    version(info.firmware_version),
+                    now.hardware_revision,
+                    version(now.firmware_version)
+                ));
+            }
+            let chosen = session.choose_finish_flags(now.firmware_version, required);
+            if chosen != planned {
+                return Err(format!(
+                    "finish flags changed between the check and the write ({} -> {}); not writing",
+                    describe_finish_flags(planned),
+                    describe_finish_flags(chosen)
+                ));
+            }
+            session.update(&image, &mut report)
+        }
+        Err(error) => Err(format!("the device stopped answering before the write ({error})")),
+    };
+    let lost = session.link_lost();
     // Release the interface before the device drops off USB and comes back
     // under a (possibly different) bus address.
     drop(link);
+
+    if let Err(error) = first {
+        if !lost {
+            return Err(error);
+        }
+        println!("\nThe device stopped answering ({error}). Reconnecting to carry on...");
+        let mut reconnect = NanoReconnect::new(nano, trace);
+        resume_after_lost_link(&mut reconnect, expected, &image, &resume_options, &mut report)?;
+    }
+    drop(report);
+    if up_to_date.get() {
+        return Ok(());
+    }
 
     println!("Waiting for the device to restart...");
     match wait_for_restart(nano) {
@@ -260,6 +302,101 @@ pub fn update(
              Unplug it, plug it back in and run `info`.",
             RESTART_TIMEOUT.as_secs()
         )),
+    }
+}
+
+/// How long to wait for the device to come back after a USB reset, and for
+/// a replug when one is asked for.
+const RESET_TIMEOUT: Duration = Duration::from_secs(10);
+const REPLUG_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Brings a Nano back after it stopped answering mid-update, for
+/// [`resume_after_lost_link`]: first a USB reset (no hands needed, if it
+/// works on the device), then, when that brought no progress, a replug the
+/// user is asked for. Either way the update then carries on by itself.
+struct NanoReconnect {
+    vendor_id: u16,
+    product_id: u16,
+    trace: bool,
+    link: Option<NanoLink>,
+}
+
+impl NanoReconnect {
+    fn new(nano: &NanoDevice, trace: bool) -> Self {
+        Self { vendor_id: nano.vendor_id, product_id: nano.product_id, trace, link: None }
+    }
+
+    fn find(&self) -> Result<Option<NanoDevice>, String> {
+        let mut found: Vec<NanoDevice> = usb::find_nano_devices()?
+            .into_iter()
+            .filter(|d| d.vendor_id == self.vendor_id && d.product_id == self.product_id)
+            .collect();
+        match found.len() {
+            0 => Ok(None),
+            1 => Ok(found.pop()),
+            _ => Err("several of these devices are connected; leave only the one being updated".to_owned()),
+        }
+    }
+
+    fn wait(&self, present: bool, timeout: Duration) -> Result<bool, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.find()?.is_some() == present {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+impl Reconnect for NanoReconnect {
+    type Link = NanoLink;
+
+    fn recover(&mut self, stage: u32) -> Result<(), String> {
+        // Release the old interface first: a reset or replug invalidates it.
+        self.link = None;
+        if stage == 0 {
+            println!("  resetting the USB connection");
+            if let Some(device) = self.find()?
+                && let Err(error) = usb::reset_nano(&device)
+            {
+                println!("  {error}");
+            }
+            // It may drop off the bus and come back, or stay put.
+            thread::sleep(Duration::from_millis(500));
+            self.wait(true, RESET_TIMEOUT)?;
+        } else {
+            println!(
+                "  Unplug the controller and plug it back in; the update then carries on by itself."
+            );
+            if !self.wait(false, REPLUG_TIMEOUT)? || !self.wait(true, REPLUG_TIMEOUT)? {
+                return Err(format!(
+                    "the controller was not replugged within {} s; the update was not finished and \
+                     the old firmware is still running. Plug it in and run the command again: it \
+                     resumes where it stopped.",
+                    REPLUG_TIMEOUT.as_secs()
+                ));
+            }
+            println!("  controller is back");
+        }
+        // Let it finish enumerating before the interface is claimed.
+        thread::sleep(Duration::from_millis(500));
+        Ok(())
+    }
+
+    fn link(&mut self) -> Result<&mut NanoLink, String> {
+        if self.link.is_none() {
+            let device = self.find()?.ok_or_else(|| "the controller is not connected".to_owned())?;
+            self.link = Some(NanoLink::open(&device, self.trace)?);
+        }
+        Ok(self.link.as_mut().expect("opened above"))
+    }
+
+    fn session_id(&mut self) -> u32 {
+        session_id()
     }
 }
 

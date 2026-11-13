@@ -156,6 +156,17 @@ pub struct CompanionEndpoint {
     /// unacked repeats. The real trigger is a guess.
     pub keepalive_limit: Option<u32>,
     unacked_keepalive: u32,
+    /// Go silent after this many host reports since the last replug, acked
+    /// or not: a model of the physical Nano (6.9.444.0) that stopped
+    /// answering about 3m46s after it was plugged in although every `1d` was
+    /// acked. What really ends it is not known; a count of reports stands in
+    /// for the time.
+    pub link_lifetime: Option<u32>,
+    reports: u32,
+    /// Whether [`CompanionEndpoint::reset`] (a USB reset from the host)
+    /// revives a silent device the way a replug does. Not known for the
+    /// physical Nano, so tests cover both.
+    pub reset_revives: bool,
     /// Silent until [`CompanionEndpoint::replug`].
     pub dead: bool,
     /// How many times finish was accepted but the image was discarded.
@@ -178,6 +189,9 @@ impl CompanionEndpoint {
             pending_version: None,
             keepalive_limit: None,
             unacked_keepalive: 0,
+            link_lifetime: None,
+            reports: 0,
+            reset_revives: true,
             dead: false,
             discarded_finishes: 0,
         }
@@ -189,13 +203,27 @@ impl CompanionEndpoint {
         self.device_seq = Sequence::default();
         self.pending.clear();
         self.unacked_keepalive = 0;
+        self.reports = 0;
         self.dead = false;
+    }
+
+    /// A USB reset from the host: a replug if [`Self::reset_revives`], else
+    /// nothing.
+    pub fn reset(&mut self) {
+        if self.reset_revives {
+            self.replug();
+        }
     }
 
     /// Feed one incoming HID report payload (after the `0x0c` ID); returns
     /// the report payloads to send back, in order.
     pub fn handle_report(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
         if self.dead {
+            return Vec::new();
+        }
+        self.reports += 1;
+        if self.link_lifetime.is_some_and(|lifetime| self.reports > lifetime) {
+            self.dead = true;
             return Vec::new();
         }
         if let Some(frame) = Frame::parse(bytes) {
