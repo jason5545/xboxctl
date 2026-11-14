@@ -188,12 +188,49 @@ pub fn name_entry(name: &str) -> Vec<u8> {
 /// the Pendragon path uses: changed buttons, then the GUID and the name
 /// (sort key 0, in the writer's order), then the type `0d` flag (sort key
 /// 500); [`set_mapping_request`] adds the end marker (sort key 1000).
-pub fn profile_entries(buttons: &[(u8, u8)], guid: [u8; 16], name: &str, flag_0d: bool) -> Vec<Vec<u8>> {
-    let mut out: Vec<Vec<u8>> = buttons.iter().map(|&(physical, target)| button_entry(physical, target)).collect();
+pub fn profile_entries(changes: &[Vec<u8>], guid: [u8; 16], name: &str, flag_0d: bool) -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = changes.to_vec();
     out.push(guid_entry(guid));
     out.push(name_entry(name));
     out.push(vec![0x04, 0x00, ENTRY_FLAG_0D, u8::from(flag_0d)]);
     out
+}
+
+pub const ENTRY_KEYBOARD: u8 = 0x09;
+
+/// A type `09` keyboard mapping (`0x180dae270`): `<physical> <key> <byte>`.
+/// The key is the low byte of the app's keyboard mapping value, probably a
+/// Windows virtual-key code; the last byte is a field of the mapping, maybe
+/// modifiers. Both readings are guesses.
+pub fn keyboard_entry(physical: u8, key: u8, extra: u8) -> Vec<u8> {
+    vec![0x06, 0x00, ENTRY_KEYBOARD, physical, key, extra]
+}
+
+/// One change to a button, for [`write_profile_then_reset`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Change {
+    /// A type `01` entry: an ordinary button, or a system command target
+    /// (`0x49` + `ProgrammableKeyAction`).
+    Target(u8),
+    /// A type `09` entry.
+    Keyboard { key: u8, extra: u8 },
+}
+
+impl Change {
+    pub fn entry(self, physical: u8) -> Vec<u8> {
+        match self {
+            Change::Target(target) => button_entry(physical, target),
+            Change::Keyboard { key, extra } => keyboard_entry(physical, key, extra),
+        }
+    }
+}
+
+/// The entry in `entries` for `physical`, of any type that has one.
+pub fn entry_for(entries: &[Vec<u8>], physical: u8) -> Option<&[u8]> {
+    entries
+        .iter()
+        .find(|entry| matches!(entry.get(2), Some(&ENTRY_BUTTON | &ENTRY_KEYBOARD)) && entry.get(3) == Some(&physical))
+        .map(Vec::as_slice)
 }
 
 /// What [`write_profile_then_reset`] saw.
@@ -213,7 +250,7 @@ pub fn write_profile_then_reset<L: Link>(
     session: &mut Session<'_, L>,
     slot: u8,
     physical: u8,
-    target: u8,
+    change: Change,
     guid: [u8; 16],
     name: &str,
     log: &mut dyn FnMut(&str),
@@ -222,24 +259,28 @@ pub fn write_profile_then_reset<L: Link>(
         return Err("slot 00 holds the default profile; not writing it".to_owned());
     }
     let before = read_mapping(session, slot)?;
+    let show = |entries: &[Vec<u8>]| entry_for(entries, physical).map_or("none".to_owned(), crate::usb::hex);
+    log(&format!("slot {slot:#04x} before: {} entries, {physical:#04x}: {}", before.entries.len(), show(&before.entries)));
+    let change_entry = change.entry(physical);
+    // An empty name means the change alone, without the GUID, name and 0d.
+    let entries = if name.is_empty() {
+        vec![change_entry.clone()]
+    } else {
+        profile_entries(std::slice::from_ref(&change_entry), guid, name, false)
+    };
     log(&format!(
-        "slot {slot:#04x} before: {} entries, {physical:#04x} -> {:02x?}",
-        before.entries.len(),
-        button_target(&before.entries, physical)
+        "writing {} entries: {}{}",
+        entries.len(),
+        crate::usb::hex(&change_entry),
+        if name.is_empty() { String::new() } else { format!(", GUID, name {name:?}, 0d") }
     ));
-    let entries = profile_entries(&[(physical, target)], guid, name, false);
-    log(&format!("writing {} entries: {physical:#04x} -> {target:#04x}, GUID, name {name:?}, 0d", entries.len()));
     let written = write_mapping(session, slot, &entries);
     if let Err(error) = &written {
         log(&format!("write failed: {error}"));
     }
     let after = written.clone().and_then(|()| read_mapping(session, slot));
     if let Ok(mapping) = &after {
-        log(&format!(
-            "read back: {} entries, {physical:#04x} -> {:02x?}",
-            mapping.entries.len(),
-            button_target(&mapping.entries, physical)
-        ));
+        log(&format!("read back: {} entries, {physical:#04x}: {}", mapping.entries.len(), show(&mapping.entries)));
         for entry in &mapping.entries {
             log(&format!("  {}", crate::usb::hex(entry)));
         }
@@ -252,9 +293,9 @@ pub fn write_profile_then_reset<L: Link>(
             format!("resetting failed: {error}; holding the pairing button for about 8 seconds clears the settings")
         })?;
     log(&format!(
-        "after reset: {} entries, {physical:#04x} -> {:02x?}, {}",
+        "after reset: {} entries, {physical:#04x}: {}, {}",
         reset.entries.len(),
-        button_target(&reset.entries, physical),
+        show(&reset.entries),
         if reset.entries == before.entries { "same as before" } else { "NOT the same as before" }
     ));
     let written = after?;
@@ -608,7 +649,7 @@ pub mod tests {
 
     #[test]
     fn builds_a_profile_the_apps_way() {
-        let entries = profile_entries(&[(ACTION_SHORT_PRESS, 0x04)], [0xab; 16], "xboxctl test", false);
+        let entries = profile_entries(&[button_entry(ACTION_SHORT_PRESS, 0x04)], [0xab; 16], "xboxctl test", false);
         let request = set_mapping_request(0x01, &entries).unwrap();
         assert_eq!(&request[..4], &[0x02, 0x09, 0x01, 5]);
         let back = parse_entries(&request[4..], 5).unwrap();
@@ -627,7 +668,7 @@ pub mod tests {
         let mut session = Session::open(&mut link, 1, options()).unwrap();
         // Where the Nano's slot 01 is now: the default profile.
         write_mapping(&mut session, 0x01, &[]).unwrap();
-        let trip = write_profile_then_reset(&mut session, 0x01, ACTION_SHORT_PRESS, 0x04, [1; 16], "xboxctl test", &mut |_| {}).unwrap();
+        let trip = write_profile_then_reset(&mut session, 0x01, ACTION_SHORT_PRESS, Change::Target(0x04), [1; 16], "xboxctl test", &mut |_| {}).unwrap();
         assert_eq!(button_target(&trip.written.entries, ACTION_SHORT_PRESS), Some(0x04));
         assert_eq!(trip.reset, trip.before);
         assert_eq!(read_mapping(&mut session, 0x00).unwrap().entries, trip.reset.entries);
@@ -638,7 +679,7 @@ pub mod tests {
         let mut link = EndpointLink::new();
         link.lose_set_reply = Some(1);
         let mut session = Session::open(&mut link, 1, options()).unwrap();
-        let error = write_profile_then_reset(&mut session, 0x01, ACTION_SHORT_PRESS, 0x04, [1; 16], "t", &mut |_| {}).unwrap_err();
+        let error = write_profile_then_reset(&mut session, 0x01, ACTION_SHORT_PRESS, Change::Target(0x04), [1; 16], "t", &mut |_| {}).unwrap_err();
         assert!(error.contains("no response"), "{error}");
         drop(session);
         assert_eq!(link.endpoint.mapping_writes, 2);
@@ -648,8 +689,21 @@ pub mod tests {
     fn never_writes_a_profile_to_the_default_slot() {
         let mut link = EndpointLink::new();
         let mut session = Session::open(&mut link, 1, options()).unwrap();
-        assert!(write_profile_then_reset(&mut session, 0x10, ACTION_SHORT_PRESS, 0x04, [1; 16], "t", &mut |_| {}).is_err());
+        assert!(write_profile_then_reset(&mut session, 0x10, ACTION_SHORT_PRESS, Change::Target(0x04), [1; 16], "t", &mut |_| {}).is_err());
         drop(session);
         assert_eq!(link.endpoint.mapping_writes, 0);
+    }
+
+    #[test]
+    fn writes_a_keyboard_mapping_as_a_type_09_entry() {
+        assert_eq!(Change::Keyboard { key: 0x7c, extra: 0 }.entry(ACTION_SHORT_PRESS), vec![0x06, 0x00, 0x09, 0x1c, 0x7c, 0x00]);
+        let mut link = EndpointLink::new();
+        let mut session = Session::open(&mut link, 1, options()).unwrap();
+        let mut lines = Vec::new();
+        write_profile_then_reset(&mut session, 0x01, ACTION_SHORT_PRESS, Change::Keyboard { key: 0x7c, extra: 0 }, [1; 16], "t", &mut |l| {
+            lines.push(l.to_owned())
+        })
+        .unwrap();
+        assert!(lines.iter().any(|l| l.contains("06 00 09 1c 7c 00")), "{lines:?}");
     }
 }

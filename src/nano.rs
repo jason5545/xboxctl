@@ -459,6 +459,7 @@ pub fn remap_test(
     target: u8,
     one_then_delete: bool,
     profile_then_reset: bool,
+    keyboard: Option<u8>,
     trace: bool,
 ) -> Result<(), String> {
     use crate::companion::settings;
@@ -483,13 +484,19 @@ pub fn remap_test(
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
         guid.copy_from_slice(&nanos.to_le_bytes());
         guid[8..12].copy_from_slice(&session_id().to_le_bytes());
-        let trip = settings::write_profile_then_reset(&mut session, slot, physical, target, guid, "xboxctl test", &mut |line| {
+        let change = match keyboard {
+            Some(key) => settings::Change::Keyboard { key, extra: 0 },
+            None => settings::Change::Target(target),
+        };
+        let name = if std::env::var("XBOXCTL_NANO_BARE_WRITE").is_ok_and(|v| v == "1") { "" } else { "xboxctl test" };
+        let trip = settings::write_profile_then_reset(&mut session, slot, physical, change, guid, name, &mut |line| {
             println!("{line}")
         })?;
+        let wanted = change.entry(physical);
         println!(
-            "done: {physical:#04x} read back as {:02x?} after the write; after the reset {:02x?}",
-            settings::button_target(&trip.written.entries, physical),
-            settings::button_target(&trip.reset.entries, physical)
+            "done: the change {} after the write; the slot is {} after the reset",
+            if trip.written.entries.contains(&wanted) { "read back" } else { "did NOT read back" },
+            if trip.reset.entries == trip.before.entries { "as before" } else { "NOT as before" }
         );
         return Ok(());
     }

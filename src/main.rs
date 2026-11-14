@@ -114,6 +114,10 @@ enum Command {
         /// the 0d flag), then reset the slot to defaults as the app does.
         #[arg(long, conflicts_with = "one_then_delete")]
         profile_then_reset: bool,
+        /// With --profile-then-reset: map the button to this keyboard key
+        /// (hex, a type 09 entry) instead of --target.
+        #[arg(long, value_parser = parse_hex_u8, requires = "profile_then_reset")]
+        keyboard: Option<u8>,
     },
     /// Download the current firmware for a GIP controller from Microsoft's
     /// firmware feed (the one the Xbox Accessories app uses).
@@ -240,10 +244,17 @@ fn main() {
             }
         }
         #[cfg(target_os = "macos")]
-        Command::NanoRemapTest { ble, slot, physical, target, one_then_delete, profile_then_reset } => {
-            if let Err(error) =
-                nano::remap_test(&ble, slot, physical, target, one_then_delete, profile_then_reset, trace_packets)
-            {
+        Command::NanoRemapTest { ble, slot, physical, target, one_then_delete, profile_then_reset, keyboard } => {
+            if let Err(error) = nano::remap_test(
+                &ble,
+                slot,
+                physical,
+                target,
+                one_then_delete,
+                profile_then_reset,
+                keyboard,
+                trace_packets,
+            ) {
                 eprintln!("{error}");
                 std::process::exit(1);
             }
