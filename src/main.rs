@@ -140,6 +140,14 @@ enum Command {
         /// How long to wait for presses.
         #[arg(long, default_value_t = 30)]
         seconds: u64,
+        /// Open this file in TextEdit just before asking for presses, so a
+        /// typed key shows up there.
+        #[arg(long)]
+        focus: Option<PathBuf>,
+        /// Write the whole profile in the app's full mode (every button to
+        /// itself, no end marker), and switch only if it reads back.
+        #[arg(long)]
+        full: bool,
     },
     /// Download the current firmware for a GIP controller from Microsoft's
     /// firmware feed (the one the Xbox Accessories app uses).
@@ -282,8 +290,10 @@ fn main() {
             }
         }
         #[cfg(target_os = "macos")]
-        Command::NanoActivateTest { ble, slot, physical, key, seconds } => {
-            if let Err(error) = nano::activate_test(&ble, slot, physical, key, seconds, trace_packets) {
+        Command::NanoActivateTest { ble, slot, physical, key, seconds, focus, full } => {
+            if let Err(error) =
+                nano::activate_test(&ble, slot, physical, key, seconds, focus.as_deref(), full, trace_packets)
+            {
                 eprintln!("{error}");
                 std::process::exit(1);
             }

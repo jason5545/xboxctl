@@ -528,7 +528,16 @@ pub fn remap_test(
 /// the reset run whatever happened before them. Something else listens to
 /// the controller's HID input meanwhile.
 #[cfg(target_os = "macos")]
-pub fn activate_test(ble_bridge: &Path, slot: u8, physical: u8, key: u8, seconds: u64, trace: bool) -> Result<(), String> {
+pub fn activate_test(
+    ble_bridge: &Path,
+    slot: u8,
+    physical: u8,
+    key: u8,
+    seconds: u64,
+    focus: Option<&Path>,
+    full: bool,
+    trace: bool,
+) -> Result<(), String> {
     use crate::companion::settings::{self, Change};
     use crate::nano_hid::BleLink;
     if slot & 0x0f == 0 {
@@ -548,12 +557,33 @@ pub fn activate_test(ble_bridge: &Path, slot: u8, physical: u8, key: u8, seconds
     let mut guid = [0u8; 16];
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     guid.copy_from_slice(&nanos.to_le_bytes());
-    let entries = settings::profile_entries(&[change.entry(physical)], guid, "xboxctl test", false);
     let trial = (|| -> Result<(), String> {
-        settings::write_mapping(&mut session, slot, &entries)?;
+        if full {
+            // Slot 02 has read blank on the Nano: the full layout.
+            let blank = settings::read_mapping(&mut session, (slot & 0x10) | if slot & 0x0f == 2 { 3 } else { 2 })?;
+            let entries = settings::full_profile(&blank.entries, physical, change.entry(physical));
+            settings::write_mapping_full(&mut session, slot, &entries)?;
+            println!("{} wrote slot {slot:#04x} in full mode, {} entries, no end marker", mark(start), entries.len());
+            let back = settings::read_mapping(&mut session, slot)?;
+            println!("{} read back {} entries:", mark(start), back.entries.len());
+            for entry in &back.entries {
+                println!("    {}", crate::usb::hex(entry));
+            }
+            if !back.entries.contains(&change.entry(physical)) {
+                return Err("the change did not read back; not switching".to_owned());
+            }
+        } else {
+            let entries = settings::profile_entries(&[change.entry(physical)], guid, "xboxctl test", false);
+            settings::write_mapping(&mut session, slot, &entries)?;
+        }
         println!("{} wrote slot {slot:#04x}: {}", mark(start), crate::usb::hex(&change.entry(physical)));
         settings::set_active_mode(&mut session, slot)?;
         println!("{} switched to slot {slot:#04x}; active mode {:02x?}", mark(start), settings::get_active_mode(&mut session));
+        if let Some(file) = focus {
+            // Bring a text document to the front so typed keys show up in it.
+            let _ = std::process::Command::new("open").arg("-a").arg("TextEdit").arg(file).status();
+            std::thread::sleep(Duration::from_millis(800));
+        }
         println!("{} PRESS NOW for {seconds} s", mark(start));
         speak("現在請按動作按鈕");
         let until = Instant::now() + Duration::from_secs(seconds);

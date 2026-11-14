@@ -90,10 +90,55 @@ pub fn set_mapping_request(slot: u8, entries: &[Vec<u8>]) -> Result<Vec<u8>, Str
     Ok(out)
 }
 
-/// Check a `set mapping` reply: status `00`, subcommand `09`.
+/// A `set mapping` request in the app's full mode (`0x180dae6c4` with its
+/// flag clear): every entry, no end marker.
+pub fn set_mapping_request_full(slot: u8, entries: &[Vec<u8>]) -> Result<Vec<u8>, String> {
+    let count = u8::try_from(entries.len()).map_err(|_| "too many entries".to_owned())?;
+    let mut out = vec![SETTINGS_MESSAGE_ID, SUB_SET_MAPPING, slot, count];
+    for entry in entries {
+        out.extend_from_slice(entry);
+    }
+    Ok(out)
+}
+
+/// Write one slot's mapping in full mode (see [`set_mapping_request_full`]).
+pub fn write_mapping_full<L: Link>(session: &mut Session<'_, L>, slot: u8, entries: &[Vec<u8>]) -> Result<(), String> {
+    let reply = session.command(OP_EXTERNAL, &set_mapping_request_full(slot, entries)?)?;
+    check_set_reply(&reply)
+}
+
+/// Each button's own target, from the app's two code tables
+/// (`0x180dadc9c` physical, `0x180d15f80` target) for the same button.
+/// `None` for the Action button's codes, which are inputs only.
+pub fn identity_target(physical: u8) -> Option<u8> {
+    match physical {
+        0x00..=0x03 => Some(physical + 0x1a),
+        0x04..=0x11 => Some(physical),
+        0x1a => Some(0x02),
+        0x1b => Some(0x03),
+        _ => None,
+    }
+}
+
+/// A full-mode profile from a blank slot's entries: every button entry set
+/// to its own target, then `physical` replaced by `change`.
+pub fn full_profile(blank: &[Vec<u8>], physical: u8, change: Vec<u8>) -> Vec<Vec<u8>> {
+    blank
+        .iter()
+        .map(|entry| match entry.as_slice() {
+            [0x05, 0x00, ENTRY_BUTTON, p, _] if *p == physical => change.clone(),
+            [0x05, 0x00, ENTRY_BUTTON, p, target] => button_entry(*p, identity_target(*p).unwrap_or(*target)),
+            _ => entry.clone(),
+        })
+        .collect()
+}
+
+/// Check a `set mapping` reply: status `00`, subcommand `09`, and the
+/// result byte after it `00` (a Nano answers `01` for a write it refused).
 pub fn check_set_reply(reply: &[u8]) -> Result<(), String> {
     match reply {
-        [0, SUB_SET_MAPPING, ..] => Ok(()),
+        [0, SUB_SET_MAPPING, 0, ..] | [0, SUB_SET_MAPPING] => Ok(()),
+        [0, SUB_SET_MAPPING, result, ..] => Err(format!("device refused the mapping (result {result:#04x})")),
         [status, ..] => Err(format!("device refused set mapping with status {status:#04x}")),
         [] => Err("empty set mapping reply".to_owned()),
     }
@@ -743,5 +788,21 @@ pub mod tests {
         assert_eq!(get_active_mode(&mut session).unwrap(), [0x80, 0x01]);
         set_active_mode(&mut session, 0x00).unwrap();
         assert_eq!(get_active_mode(&mut session).unwrap(), [0x80, 0x00]);
+    }
+
+    #[test]
+    fn builds_a_full_profile_from_the_blank_layout() {
+        let blank = parse_mapping(&bytes(NANO_SLOT_01)).unwrap().entries;
+        let full = full_profile(&blank, ACTION_SHORT_PRESS, keyboard_entry(ACTION_SHORT_PRESS, 0x41, 0));
+        assert_eq!(full.len(), 28);
+        assert_eq!(button_target(&full, 0x04), Some(0x04));
+        assert_eq!(button_target(&full, 0x00), Some(0x1a));
+        assert_eq!(button_target(&full, 0x1a), Some(0x02));
+        assert_eq!(button_target(&full, 0x1d), Some(0x00));
+        assert!(full.contains(&keyboard_entry(ACTION_SHORT_PRESS, 0x41, 0)));
+        assert_eq!(full.iter().filter(|e| e[2] != ENTRY_BUTTON).count(), blank.iter().filter(|e| e[2] != ENTRY_BUTTON).count() + 1);
+        let request = set_mapping_request_full(0x01, &full).unwrap();
+        assert_eq!(&request[..4], &[0x02, 0x09, 0x01, 28]);
+        assert_ne!(&request[request.len() - 3..], &END_MARKER);
     }
 }

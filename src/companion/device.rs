@@ -417,7 +417,12 @@ impl CompanionEndpoint {
                     return vec![0x02];
                 };
                 if entries.last().map(Vec::as_slice) != Some(&settings::END_MARKER[..]) {
-                    return vec![0x02];
+                    // Full mode: stored as sent. What a Nano does with it
+                    // is what the next hardware run tries.
+                    let flags = self.mappings.get(slot).map_or(0, |(flags, _)| *flags);
+                    self.mappings.insert(*slot, (flags, entries));
+                    self.mapping_writes += 1;
+                    return vec![0, settings::SUB_SET_MAPPING, 0];
                 }
                 entries.pop();
                 let flags = self.mappings.get(slot).map_or(0, |(flags, _)| *flags);
