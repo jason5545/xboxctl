@@ -12,4 +12,5 @@ pub mod device;
 pub mod firmware;
 pub mod frame;
 pub mod protocol;
+pub mod settings;
 pub mod updater;

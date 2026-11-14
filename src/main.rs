@@ -89,6 +89,28 @@ enum Command {
         #[arg(long)]
         no_fetch: bool,
     },
+    /// List a Nano's mapping slots, then remap one button and put it back,
+    /// reading back after each write. Over Bluetooth LE.
+    #[cfg(target_os = "macos")]
+    #[command(hide = true)]
+    NanoRemapTest {
+        /// The nano-ble-bridge app.
+        #[arg(long)]
+        ble: PathBuf,
+        /// Slot to write, in hex.
+        #[arg(long, default_value = "01", value_parser = parse_hex_u8)]
+        slot: u8,
+        /// Physical button, in hex (1c: Action button, short press).
+        #[arg(long, default_value = "1c", value_parser = parse_hex_u8)]
+        physical: u8,
+        /// Target to map it to while testing, in hex.
+        #[arg(long, default_value = "04", value_parser = parse_hex_u8)]
+        target: u8,
+        /// Write only the one entry, as the app does, then delete the
+        /// slot's profile instead of writing the original back.
+        #[arg(long)]
+        one_then_delete: bool,
+    },
     /// Download the current firmware for a GIP controller from Microsoft's
     /// firmware feed (the one the Xbox Accessories app uses).
     Download {
@@ -209,6 +231,13 @@ fn main() {
         #[cfg(target_os = "macos")]
         Command::NanoHold { ble, seconds, no_fetch } => {
             if let Err(error) = nano::hold(ble.as_deref(), seconds, !no_fetch, trace_packets) {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+        #[cfg(target_os = "macos")]
+        Command::NanoRemapTest { ble, slot, physical, target, one_then_delete } => {
+            if let Err(error) = nano::remap_test(&ble, slot, physical, target, one_then_delete, trace_packets) {
                 eprintln!("{error}");
                 std::process::exit(1);
             }
@@ -947,4 +976,9 @@ fn start_device(link: &mut UsbLink) -> Result<Option<Hello>, String> {
         }
     }
     Ok(None)
+}
+
+#[cfg(target_os = "macos")]
+fn parse_hex_u8(value: &str) -> Result<u8, String> {
+    u8::from_str_radix(value.trim_start_matches("0x"), 16).map_err(|error| format!("{value}: {error}"))
 }

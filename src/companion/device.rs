@@ -6,7 +6,8 @@
 
 use crate::companion::frame::{self, Frame, Reassembler, Sequence};
 use crate::companion::protocol;
-use std::collections::VecDeque;
+use crate::companion::settings;
+use std::collections::{BTreeMap, VecDeque};
 
 /// Fragment payload size the fake device uses for its own replies; matches
 /// the 63-byte reports the QEMU fake Nano exposes.
@@ -197,6 +198,20 @@ pub struct CompanionEndpoint {
     tap_unacked: bool,
     /// Records the host fetched.
     pub telemetry_fetched: u32,
+    /// Button mappings by slot (flags byte, entries), preloaded with what a
+    /// physical Nano reported for slots 00, 01, 10 and 11.
+    pub mappings: BTreeMap<u8, (u8, Vec<Vec<u8>>)>,
+    /// `set mapping` requests accepted.
+    pub mapping_writes: u32,
+    /// Store a `set mapping` request's entries as sent. Off, the fake does
+    /// what a physical Nano (6.19.50.0) did with a full 28-entry write whose
+    /// button targets were all `00`: it stored the default profile (slot
+    /// 00's five entries) instead. Off, it also applies written button
+    /// entries with a non-zero target on top of that default; whether a
+    /// Nano does is what the next hardware run tries.
+    pub store_as_written: bool,
+    /// `delete profile` requests accepted; a deleted slot reads back blank.
+    pub profile_deletes: u32,
     /// Silent until [`CompanionEndpoint::replug`].
     pub dead: bool,
     /// How many times finish was accepted but the image was discarded.
@@ -229,6 +244,10 @@ impl CompanionEndpoint {
             telemetry_since: None,
             tap_unacked: false,
             telemetry_fetched: 0,
+            mappings: nano_mappings(),
+            mapping_writes: 0,
+            store_as_written: false,
+            profile_deletes: 0,
             dead: false,
             discarded_finishes: 0,
         }
@@ -364,6 +383,7 @@ impl CompanionEndpoint {
                     }
                     TelemetryReply::Records => Vec::new(),
                 },
+                settings::OP_EXTERNAL => self.external_response(&message),
                 protocol::OP_DEVICE_INFO => self.device.device_info_response(),
                 protocol::OP_DEVICE_INFO_LEGACY => self.device.device_info_response()[..0x33].to_vec(),
                 protocol::OP_UPDATE => self.device.update_response(&message),
@@ -372,6 +392,58 @@ impl CompanionEndpoint {
             out.extend(self.queue_response(frame.opcode, &response));
         }
         out
+    }
+
+    /// `1e` settings messages. What a physical Nano answers to a slot it
+    /// does not have, or to a write without the end marker, is not known;
+    /// the fake answers `02` (bad argument).
+    fn external_response(&mut self, message: &[u8]) -> Vec<u8> {
+        match message {
+            [settings::SETTINGS_MESSAGE_ID, settings::SUB_GET_MAPPING, slot] => match self.mappings.get(slot) {
+                Some((flags, entries)) => {
+                    let mut out = vec![0, settings::SUB_GET_MAPPING, *flags, *slot, entries.len() as u8];
+                    for entry in entries {
+                        out.extend_from_slice(entry);
+                    }
+                    out
+                }
+                None => vec![0x02],
+            },
+            [settings::SETTINGS_MESSAGE_ID, settings::SUB_SET_MAPPING, slot, count, rest @ ..] => {
+                let Ok(mut entries) = settings::parse_entries(rest, usize::from(*count)) else {
+                    return vec![0x02];
+                };
+                if entries.last().map(Vec::as_slice) != Some(&settings::END_MARKER[..]) {
+                    return vec![0x02];
+                }
+                entries.pop();
+                let flags = self.mappings.get(slot).map_or(0, |(flags, _)| *flags);
+                let stored = if self.store_as_written {
+                    entries
+                } else {
+                    let mut stored = default_profile();
+                    for entry in &entries {
+                        if let [0x05, 0x00, settings::ENTRY_BUTTON, physical, target] = entry.as_slice()
+                            && *target != 0
+                        {
+                            stored = settings::with_button(&stored, *physical, *target);
+                        }
+                    }
+                    stored
+                };
+                self.mappings.insert(*slot, (flags, stored));
+                self.mapping_writes += 1;
+                vec![0, settings::SUB_SET_MAPPING, 0]
+            }
+            [settings::SETTINGS_MESSAGE_ID, settings::SUB_DELETE_PROFILE, slot] if *slot & 0x0f != 0 => {
+                let flags = self.mappings.get(slot).map_or(0, |(flags, _)| *flags);
+                self.mappings.insert(*slot, (flags, blank_profile()));
+                self.profile_deletes += 1;
+                vec![0, settings::SUB_DELETE_PROFILE, 0]
+            }
+            [settings::SETTINGS_MESSAGE_ID, ..] => vec![0x02],
+            _ => vec![0x43],
+        }
     }
 
     fn session_accept(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
@@ -398,4 +470,29 @@ impl CompanionEndpoint {
         self.pending = frames.into();
         vec![first]
     }
+}
+
+fn default_profile() -> Vec<Vec<u8>> {
+    use settings::tests::{bytes, NANO_SLOT_00};
+    settings::parse_mapping(&bytes(NANO_SLOT_00)).unwrap().entries
+}
+
+/// What a physical Nano's unused slots read as: 28 entries, every button
+/// target `00`.
+fn blank_profile() -> Vec<Vec<u8>> {
+    use settings::tests::{bytes, NANO_SLOT_01};
+    settings::parse_mapping(&bytes(NANO_SLOT_01)).unwrap().entries
+}
+
+/// Slots 00–07 and 10–17 as a physical Nano (6.19.50.0) reported them:
+/// the active default in 00 (and its shift layer 10), every other slot
+/// blank.
+fn nano_mappings() -> BTreeMap<u8, (u8, Vec<Vec<u8>>)> {
+    let mut out = BTreeMap::new();
+    out.insert(0x00, (0x80, default_profile()));
+    out.insert(0x10, (0x00, default_profile()));
+    for slot in (0x01..=0x07).chain(0x11..=0x17) {
+        out.insert(slot, (0x00, blank_profile()));
+    }
+    out
 }

@@ -448,6 +448,57 @@ fn hold_on<L: crate::companion::updater::Link>(link: &mut L, seconds: u64, fetch
     }
 }
 
+/// Which mapping slots answer, then one remap and its undo: `physical` to
+/// `target` in `slot`, read back, original written back and read again
+/// (see [`crate::companion::settings::remap_and_restore`]).
+#[cfg(target_os = "macos")]
+pub fn remap_test(
+    ble_bridge: &Path,
+    slot: u8,
+    physical: u8,
+    target: u8,
+    one_then_delete: bool,
+    trace: bool,
+) -> Result<(), String> {
+    use crate::companion::settings;
+    use crate::nano_hid::BleLink;
+    println!("Bluetooth LE GATT channel via {}", ble_bridge.display());
+    let mut link = BleLink::launch(ble_bridge, trace)?;
+    let mut session = open_session(&mut link)?;
+    let slots: Vec<u8> = (0x00..=0x07).chain(0x10..=0x17).collect();
+    for probe in slots {
+        match settings::read_mapping(&mut session, probe) {
+            Ok(mapping) => println!(
+                "slot {probe:#04x}: flags {:#04x}, {} entries, action short press -> {:02x?}",
+                mapping.flags,
+                mapping.entries.len(),
+                settings::button_target(&mapping.entries, settings::ACTION_SHORT_PRESS)
+            ),
+            Err(error) => println!("slot {probe:#04x}: {error}"),
+        }
+    }
+    if one_then_delete {
+        // Slot 02 has read blank on the Nano; any unused slot will do.
+        let reference = if slot & 0x0f == 2 { slot + 1 } else { (slot & 0x10) | 2 };
+        let trip = settings::write_one_then_delete(&mut session, slot, physical, target, reference, &mut |line| {
+            println!("{line}")
+        })?;
+        println!(
+            "done: {physical:#04x} read back as {:02x?} after the write; slot {}",
+            settings::button_target(&trip.written.entries, physical),
+            if trip.deleted_is_blank { "blank again" } else { "NOT blank after the delete" }
+        );
+        return Ok(());
+    }
+    let trip = settings::remap_and_restore(&mut session, slot, physical, target, &mut |line| println!("{line}"))?;
+    println!(
+        "done: {physical:#04x} read back as {:02x?}, now {:02x?} again",
+        settings::button_target(&trip.changed.entries, physical),
+        settings::button_target(&trip.restored.entries, physical)
+    );
+    Ok(())
+}
+
 /// How long to wait for the device to come back after a USB reset, and for
 /// a replug when one is asked for.
 const RESET_TIMEOUT: Duration = Duration::from_secs(10);

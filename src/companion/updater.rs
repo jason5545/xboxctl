@@ -36,10 +36,13 @@ pub struct Options {
     /// (0x180043e50, fed from 0x180019fa0); what bit 1 does on the device is
     /// not known, so this is a knob (`XBOXCTL_NANO_FINISH_FLAGS`), not a rule.
     pub finish_flags: Option<u8>,
-    /// Ack the frames the device sends on its own channel (handle + 1), such
-    /// as `05 <handle+1> 1d <seq> 00`, which it repeats with a constant
+    /// Ack the frames the device sends on its own channel, such as
+    /// `05 <handle+1> 1d <seq> 00`, which it repeats with a constant
     /// sequence until acked. Frames on the session's own handle are always
-    /// acked. On by default, as the protocol asks of a receiver; a physical
+    /// acked. The channel is handle + 1 for the first session after the
+    /// device connects; a later session on the same connection (handle 04
+    /// after 02, over Bluetooth) still got the device's taps on 03, so any
+    /// handle other than the session's counts. On by default, as the protocol asks of a receiver; a physical
     /// Nano (6.9.444.0) took these acks without trouble. They did not keep
     /// it alive, though: it stopped answering about 3m46s after it was
     /// plugged in with them, as it had after about 1,430 unacked repeats
@@ -225,13 +228,15 @@ impl<'a, L: Link> Session<'a, L> {
     /// Next device report. Acks every data frame on the session's handle as
     /// it arrives, whichever request is waiting (the device resends a frame
     /// until it is acked, also replies that come late), and, with
-    /// `ack_device_1d`, those on the device's own channel (handle + 1).
-    /// Notes telemetry taps there for [`Self::fetch_pending_telemetry`].
+    /// `ack_device_1d`, those on any other handle: the device's own
+    /// channel, which need not be this session's handle + 1 (see
+    /// [`Options::ack_device_1d`]). Notes telemetry taps there for
+    /// [`Self::fetch_pending_telemetry`].
     fn recv(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, String> {
         let bytes = self.link.recv(timeout)?;
         if let Some(frame) = bytes.as_deref().and_then(Frame::parse) {
             let data = frame.is_fragment() || frame.kind == frame::TYPE_SINGLE;
-            let device_channel = frame.handle == self.handle.wrapping_add(1);
+            let device_channel = frame.handle != self.handle;
             let channel = frame.handle == self.handle || (self.options.ack_device_1d && device_channel);
             if data && channel {
                 self.link.send(&frame::ack(frame.handle, frame.opcode, frame.seq))?;
@@ -442,6 +447,14 @@ impl<'a, L: Link> Session<'a, L> {
     /// probing requests whose meaning is still being worked out. Never use it
     /// for a request that changes the device.
     pub fn query(&mut self, opcode: u8, payload: &[u8], timeout: Duration) -> Result<Vec<u8>, String> {
+        self.request_with_attempts(opcode, payload, timeout, 1)
+    }
+
+    /// One request that changes the device, sent once with the SDK's
+    /// mutation timeout and never resent: a lost reply does not show
+    /// whether the device applied it.
+    pub fn command(&mut self, opcode: u8, payload: &[u8]) -> Result<Vec<u8>, String> {
+        let timeout = self.options.mutation_timeout;
         self.request_with_attempts(opcode, payload, timeout, 1)
     }
 
@@ -1756,6 +1769,28 @@ mod tests {
         assert_eq!(session.telemetry().taps, 1);
         drop(session);
         assert_eq!(telemetry_requests(&link), 0);
+    }
+
+    #[test]
+    fn taps_on_an_earlier_sessions_channel_are_acked_and_fetched() {
+        // Seen over Bluetooth: a second session got handle 04, but the
+        // device kept tapping on 03, the first session's handle + 1.
+        let mut link = retail_link();
+        link.endpoint.queue_telemetry(2);
+        let mut session = Session::open(&mut link, 0x1234_5678, telemetry_options()).unwrap();
+        let earlier = session.handle.wrapping_sub(1);
+        session.link.queue.clear();
+        session.link.queue.push_back(vec![frame::TYPE_SINGLE, earlier, 0x1b, 0x3d, 2, 0x01, 0x46]);
+        session.link.queue.push_back(vec![frame::TYPE_SINGLE, earlier, OP_TELEMETRY, 0x38, 0]);
+        session.pump(Duration::from_millis(1)).unwrap();
+        session.pump(Duration::from_millis(1)).unwrap();
+        let telemetry = session.telemetry().clone();
+        drop(session);
+        assert!(link.sent.contains(&frame::ack(0x7d, 0x1b, 0x3d)), "the battery tap was not acked");
+        assert!(link.sent.contains(&frame::ack(0x7d, OP_TELEMETRY, 0x38)), "the telemetry tap was not acked");
+        // The fake also taps on its own channel until acked.
+        assert!(telemetry.taps >= 1);
+        assert_eq!(telemetry.records, 2);
     }
 
     #[test]
