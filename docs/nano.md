@@ -310,8 +310,9 @@ a read-only session open past four minutes to try it.
   telemetry is enough, and which handle the fetch belongs on (the session's
   is assumed). Also whether a USB reset revives it like a replug does. A firmware newer than 6.19.50.0, or a
   capture of the Xbox Accessories service updating one, would show it.
-- The meaning of external message `1e 02 05`, and the requests behind battery
-  level and the other settings pages.
+- Button remapping and the other settings pages are covered in
+  [Nano settings messages](../nano-settings/): `1e 02 05` is the friendly
+  name, and the Action button can be mapped to a keyboard key.
 
 A capture of a real Nano connected to Windows with the Xbox Accessories app
 running would answer most of these, as would running `xboxctl` itself against
