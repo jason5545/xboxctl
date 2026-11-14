@@ -458,6 +458,7 @@ pub fn remap_test(
     physical: u8,
     target: u8,
     one_then_delete: bool,
+    profile_then_reset: bool,
     trace: bool,
 ) -> Result<(), String> {
     use crate::companion::settings;
@@ -476,6 +477,21 @@ pub fn remap_test(
             ),
             Err(error) => println!("slot {probe:#04x}: {error}"),
         }
+    }
+    if profile_then_reset {
+        let mut guid = [0u8; 16];
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        guid.copy_from_slice(&nanos.to_le_bytes());
+        guid[8..12].copy_from_slice(&session_id().to_le_bytes());
+        let trip = settings::write_profile_then_reset(&mut session, slot, physical, target, guid, "xboxctl test", &mut |line| {
+            println!("{line}")
+        })?;
+        println!(
+            "done: {physical:#04x} read back as {:02x?} after the write; after the reset {:02x?}",
+            settings::button_target(&trip.written.entries, physical),
+            settings::button_target(&trip.reset.entries, physical)
+        );
+        return Ok(());
     }
     if one_then_delete {
         // Slot 02 has read blank on the Nano; any unused slot will do.

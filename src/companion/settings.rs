@@ -162,6 +162,105 @@ pub fn delete_profile<L: Link>(session: &mut Session<'_, L>, slot: u8) -> Result
     }
 }
 
+pub const ENTRY_FLAG_0D: u8 = 0x0d;
+pub const ENTRY_GUID: u8 = 0x11;
+pub const ENTRY_NAME: u8 = 0x12;
+/// Bytes of the name field in a type `12` entry.
+pub const NAME_LEN: usize = 128;
+
+pub fn guid_entry(guid: [u8; 16]) -> Vec<u8> {
+    let mut out = vec![0x13, 0x00, ENTRY_GUID];
+    out.extend_from_slice(&guid);
+    out
+}
+
+/// A type `12` entry: the name in UTF-8, zero padded (cut to fit).
+pub fn name_entry(name: &str) -> Vec<u8> {
+    let mut out = vec![0x83, 0x00, ENTRY_NAME];
+    let mut bytes = name.as_bytes().to_vec();
+    bytes.truncate(NAME_LEN);
+    bytes.resize(NAME_LEN, 0);
+    out.extend(bytes);
+    out
+}
+
+/// A profile as the app writes one in its differences-only mode, the one
+/// the Pendragon path uses: changed buttons, then the GUID and the name
+/// (sort key 0, in the writer's order), then the type `0d` flag (sort key
+/// 500); [`set_mapping_request`] adds the end marker (sort key 1000).
+pub fn profile_entries(buttons: &[(u8, u8)], guid: [u8; 16], name: &str, flag_0d: bool) -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = buttons.iter().map(|&(physical, target)| button_entry(physical, target)).collect();
+    out.push(guid_entry(guid));
+    out.push(name_entry(name));
+    out.push(vec![0x04, 0x00, ENTRY_FLAG_0D, u8::from(flag_0d)]);
+    out
+}
+
+/// What [`write_profile_then_reset`] saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileThenReset {
+    pub before: Mapping,
+    pub written: Mapping,
+    pub reset: Mapping,
+}
+
+/// Write a whole profile the app's way (one button changed, a GUID, a
+/// name, the `0d` flag) to `slot`, read it back, then reset the slot the
+/// way the app's "restore defaults" does, an empty differences-only write
+/// (`09 <slot> 01 03 00 00`), and read again. The reset runs even when the
+/// write went unanswered. Never touches slot 00 or 10.
+pub fn write_profile_then_reset<L: Link>(
+    session: &mut Session<'_, L>,
+    slot: u8,
+    physical: u8,
+    target: u8,
+    guid: [u8; 16],
+    name: &str,
+    log: &mut dyn FnMut(&str),
+) -> Result<ProfileThenReset, String> {
+    if slot & 0x0f == 0 {
+        return Err("slot 00 holds the default profile; not writing it".to_owned());
+    }
+    let before = read_mapping(session, slot)?;
+    log(&format!(
+        "slot {slot:#04x} before: {} entries, {physical:#04x} -> {:02x?}",
+        before.entries.len(),
+        button_target(&before.entries, physical)
+    ));
+    let entries = profile_entries(&[(physical, target)], guid, name, false);
+    log(&format!("writing {} entries: {physical:#04x} -> {target:#04x}, GUID, name {name:?}, 0d", entries.len()));
+    let written = write_mapping(session, slot, &entries);
+    if let Err(error) = &written {
+        log(&format!("write failed: {error}"));
+    }
+    let after = written.clone().and_then(|()| read_mapping(session, slot));
+    if let Ok(mapping) = &after {
+        log(&format!(
+            "read back: {} entries, {physical:#04x} -> {:02x?}",
+            mapping.entries.len(),
+            button_target(&mapping.entries, physical)
+        ));
+        for entry in &mapping.entries {
+            log(&format!("  {}", crate::usb::hex(entry)));
+        }
+    }
+
+    log(&format!("resetting slot {slot:#04x} to defaults (09 {slot:02x} 01 03 00 00)"));
+    let reset = write_mapping(session, slot, &[])
+        .and_then(|()| read_mapping(session, slot))
+        .map_err(|error| {
+            format!("resetting failed: {error}; holding the pairing button for about 8 seconds clears the settings")
+        })?;
+    log(&format!(
+        "after reset: {} entries, {physical:#04x} -> {:02x?}, {}",
+        reset.entries.len(),
+        button_target(&reset.entries, physical),
+        if reset.entries == before.entries { "same as before" } else { "NOT the same as before" }
+    ));
+    let written = after?;
+    Ok(ProfileThenReset { before, written, reset })
+}
+
 /// What [`write_one_then_delete`] saw.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OneThenDelete {
@@ -505,5 +604,52 @@ pub mod tests {
         assert!(write_one_then_delete(&mut session, 0x10, ACTION_SHORT_PRESS, 0x04, 0x02, &mut |_| {}).is_err());
         drop(session);
         assert_eq!((link.endpoint.mapping_writes, link.endpoint.profile_deletes), (0, 0));
+    }
+
+    #[test]
+    fn builds_a_profile_the_apps_way() {
+        let entries = profile_entries(&[(ACTION_SHORT_PRESS, 0x04)], [0xab; 16], "xboxctl test", false);
+        let request = set_mapping_request(0x01, &entries).unwrap();
+        assert_eq!(&request[..4], &[0x02, 0x09, 0x01, 5]);
+        let back = parse_entries(&request[4..], 5).unwrap();
+        assert_eq!(back[0], button_entry(ACTION_SHORT_PRESS, 0x04));
+        assert_eq!((back[1].len(), back[1][2]), (19, ENTRY_GUID));
+        assert_eq!((back[2].len(), back[2][2]), (131, ENTRY_NAME));
+        assert_eq!(&back[2][3..15], b"xboxctl test");
+        assert_eq!(back[3], vec![0x04, 0x00, 0x0d, 0x00]);
+        assert_eq!(back[4], END_MARKER.to_vec());
+        assert_eq!(set_mapping_request(0x01, &[]).unwrap(), vec![0x02, 0x09, 0x01, 0x01, 0x03, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn writes_a_profile_then_resets_to_the_default() {
+        let mut link = EndpointLink::new();
+        let mut session = Session::open(&mut link, 1, options()).unwrap();
+        // Where the Nano's slot 01 is now: the default profile.
+        write_mapping(&mut session, 0x01, &[]).unwrap();
+        let trip = write_profile_then_reset(&mut session, 0x01, ACTION_SHORT_PRESS, 0x04, [1; 16], "xboxctl test", &mut |_| {}).unwrap();
+        assert_eq!(button_target(&trip.written.entries, ACTION_SHORT_PRESS), Some(0x04));
+        assert_eq!(trip.reset, trip.before);
+        assert_eq!(read_mapping(&mut session, 0x00).unwrap().entries, trip.reset.entries);
+    }
+
+    #[test]
+    fn resets_even_when_the_profile_write_goes_unanswered() {
+        let mut link = EndpointLink::new();
+        link.lose_set_reply = Some(1);
+        let mut session = Session::open(&mut link, 1, options()).unwrap();
+        let error = write_profile_then_reset(&mut session, 0x01, ACTION_SHORT_PRESS, 0x04, [1; 16], "t", &mut |_| {}).unwrap_err();
+        assert!(error.contains("no response"), "{error}");
+        drop(session);
+        assert_eq!(link.endpoint.mapping_writes, 2);
+    }
+
+    #[test]
+    fn never_writes_a_profile_to_the_default_slot() {
+        let mut link = EndpointLink::new();
+        let mut session = Session::open(&mut link, 1, options()).unwrap();
+        assert!(write_profile_then_reset(&mut session, 0x10, ACTION_SHORT_PRESS, 0x04, [1; 16], "t", &mut |_| {}).is_err());
+        drop(session);
+        assert_eq!(link.endpoint.mapping_writes, 0);
     }
 }

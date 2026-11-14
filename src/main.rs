@@ -110,6 +110,10 @@ enum Command {
         /// slot's profile instead of writing the original back.
         #[arg(long)]
         one_then_delete: bool,
+        /// Write a whole profile the app's way (the button, a GUID, a name,
+        /// the 0d flag), then reset the slot to defaults as the app does.
+        #[arg(long, conflicts_with = "one_then_delete")]
+        profile_then_reset: bool,
     },
     /// Download the current firmware for a GIP controller from Microsoft's
     /// firmware feed (the one the Xbox Accessories app uses).
@@ -236,8 +240,10 @@ fn main() {
             }
         }
         #[cfg(target_os = "macos")]
-        Command::NanoRemapTest { ble, slot, physical, target, one_then_delete } => {
-            if let Err(error) = nano::remap_test(&ble, slot, physical, target, one_then_delete, trace_packets) {
+        Command::NanoRemapTest { ble, slot, physical, target, one_then_delete, profile_then_reset } => {
+            if let Err(error) =
+                nano::remap_test(&ble, slot, physical, target, one_then_delete, profile_then_reset, trace_packets)
+            {
                 eprintln!("{error}");
                 std::process::exit(1);
             }
