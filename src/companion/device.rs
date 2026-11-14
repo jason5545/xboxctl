@@ -212,6 +212,8 @@ pub struct CompanionEndpoint {
     pub store_as_written: bool,
     /// `delete profile` requests accepted; a deleted slot reads back blank.
     pub profile_deletes: u32,
+    /// The active slot; a physical Nano reported `80 00` on its default.
+    pub active_slot: u8,
     /// Silent until [`CompanionEndpoint::replug`].
     pub dead: bool,
     /// How many times finish was accepted but the image was discarded.
@@ -248,6 +250,7 @@ impl CompanionEndpoint {
             mapping_writes: 0,
             store_as_written: false,
             profile_deletes: 0,
+            active_slot: 0,
             dead: false,
             discarded_finishes: 0,
         }
@@ -440,6 +443,13 @@ impl CompanionEndpoint {
                 self.mappings.insert(*slot, (flags, blank_profile()));
                 self.profile_deletes += 1;
                 vec![0, settings::SUB_DELETE_PROFILE, 0]
+            }
+            [settings::SETTINGS_MESSAGE_ID, settings::SUB_GET_ACTIVE_MODE] => {
+                vec![0, settings::SUB_GET_ACTIVE_MODE, 0x80, self.active_slot]
+            }
+            [settings::SETTINGS_MESSAGE_ID, settings::SUB_SET_ACTIVE_MODE, slot] if self.mappings.contains_key(slot) => {
+                self.active_slot = *slot;
+                vec![0, settings::SUB_SET_ACTIVE_MODE, 0x80, *slot]
             }
             [settings::SETTINGS_MESSAGE_ID, ..] => vec![0x02],
             _ => vec![0x43],

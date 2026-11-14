@@ -19,6 +19,8 @@ pub const OP_EXTERNAL: u8 = 0x1e;
 pub const SUB_GET_MAPPING: u8 = 0x08;
 pub const SUB_SET_MAPPING: u8 = 0x09;
 pub const SUB_DELETE_PROFILE: u8 = 0x0a;
+pub const SUB_GET_ACTIVE_MODE: u8 = 0x03;
+pub const SUB_SET_ACTIVE_MODE: u8 = 0x06;
 pub const ENTRY_BUTTON: u8 = 0x01;
 /// Written last by the app; not in the device's replies.
 pub const END_MARKER: [u8; 3] = [0x03, 0x00, 0x00];
@@ -231,6 +233,31 @@ pub fn entry_for(entries: &[Vec<u8>], physical: u8) -> Option<&[u8]> {
         .iter()
         .find(|entry| matches!(entry.get(2), Some(&ENTRY_BUTTON | &ENTRY_KEYBOARD)) && entry.get(3) == Some(&physical))
         .map(Vec::as_slice)
+}
+
+/// The active mode reply's two bytes after the subcommand: a physical Nano
+/// on its default profile answered `80 00`. Which byte is the slot is not
+/// settled.
+pub fn get_active_mode<L: Link>(session: &mut Session<'_, L>) -> Result<[u8; 2], String> {
+    let reply = session.query(OP_EXTERNAL, &[SETTINGS_MESSAGE_ID, SUB_GET_ACTIVE_MODE], READ_TIMEOUT)?;
+    match reply.as_slice() {
+        [0, SUB_GET_ACTIVE_MODE, a, b, ..] => Ok([*a, *b]),
+        [status, ..] => Err(format!("device refused get active mode with status {status:#04x}")),
+        [] => Err("empty get active mode reply".to_owned()),
+    }
+}
+
+/// Make `slot` the active profile (`06 <slot>`). A physical Nano answers
+/// like get active mode, `00 06 80 <slot>`: the slot it is now on.
+pub fn set_active_mode<L: Link>(session: &mut Session<'_, L>, slot: u8) -> Result<(), String> {
+    match session.command(OP_EXTERNAL, &[SETTINGS_MESSAGE_ID, SUB_SET_ACTIVE_MODE, slot])?.as_slice() {
+        [0, SUB_SET_ACTIVE_MODE, _, now, ..] if *now == slot => Ok(()),
+        [0, SUB_SET_ACTIVE_MODE, flags, now, ..] => {
+            Err(format!("device stayed on {flags:#04x} {now:#04x} instead of slot {slot:#04x}"))
+        }
+        [status, ..] => Err(format!("device refused set active mode with status {status:#04x}")),
+        [] => Err("empty set active mode reply".to_owned()),
+    }
 }
 
 /// What [`write_profile_then_reset`] saw.
@@ -705,5 +732,16 @@ pub mod tests {
         })
         .unwrap();
         assert!(lines.iter().any(|l| l.contains("06 00 09 1c 7c 00")), "{lines:?}");
+    }
+
+    #[test]
+    fn switches_the_active_mode_and_back() {
+        let mut link = EndpointLink::new();
+        let mut session = Session::open(&mut link, 1, options()).unwrap();
+        assert_eq!(get_active_mode(&mut session).unwrap(), [0x80, 0x00]);
+        set_active_mode(&mut session, 0x01).unwrap();
+        assert_eq!(get_active_mode(&mut session).unwrap(), [0x80, 0x01]);
+        set_active_mode(&mut session, 0x00).unwrap();
+        assert_eq!(get_active_mode(&mut session).unwrap(), [0x80, 0x00]);
     }
 }

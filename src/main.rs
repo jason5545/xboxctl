@@ -119,6 +119,28 @@ enum Command {
         #[arg(long, value_parser = parse_hex_u8, requires = "profile_then_reset")]
         keyboard: Option<u8>,
     },
+    /// Map a Nano button to a keyboard key in a spare slot, make that slot
+    /// active while asking aloud for presses, then switch back to slot 00
+    /// and reset the spare slot. Over Bluetooth LE.
+    #[cfg(target_os = "macos")]
+    #[command(hide = true)]
+    NanoActivateTest {
+        /// The nano-ble-bridge app.
+        #[arg(long)]
+        ble: PathBuf,
+        /// Spare slot to use, in hex.
+        #[arg(long, default_value = "01", value_parser = parse_hex_u8)]
+        slot: u8,
+        /// Physical button, in hex (1c: Action button, short press).
+        #[arg(long, default_value = "1c", value_parser = parse_hex_u8)]
+        physical: u8,
+        /// Keyboard key, in hex (7c: F13 as a Windows virtual-key code).
+        #[arg(long, default_value = "7c", value_parser = parse_hex_u8)]
+        key: u8,
+        /// How long to wait for presses.
+        #[arg(long, default_value_t = 30)]
+        seconds: u64,
+    },
     /// Download the current firmware for a GIP controller from Microsoft's
     /// firmware feed (the one the Xbox Accessories app uses).
     Download {
@@ -255,6 +277,13 @@ fn main() {
                 keyboard,
                 trace_packets,
             ) {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+        #[cfg(target_os = "macos")]
+        Command::NanoActivateTest { ble, slot, physical, key, seconds } => {
+            if let Err(error) = nano::activate_test(&ble, slot, physical, key, seconds, trace_packets) {
                 eprintln!("{error}");
                 std::process::exit(1);
             }

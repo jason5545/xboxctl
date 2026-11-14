@@ -522,6 +522,63 @@ pub fn remap_test(
     Ok(())
 }
 
+/// Try a keyboard mapping for real: write `physical` -> keyboard `key` to
+/// `slot`, make `slot` active, ask (aloud) for presses for `seconds`, then
+/// switch back to slot 00 and reset `slot` to defaults. The switch back and
+/// the reset run whatever happened before them. Something else listens to
+/// the controller's HID input meanwhile.
+#[cfg(target_os = "macos")]
+pub fn activate_test(ble_bridge: &Path, slot: u8, physical: u8, key: u8, seconds: u64, trace: bool) -> Result<(), String> {
+    use crate::companion::settings::{self, Change};
+    use crate::nano_hid::BleLink;
+    if slot & 0x0f == 0 {
+        return Err("pick a slot other than 00 and 10".to_owned());
+    }
+    let speak = |text: &str| {
+        let _ = std::process::Command::new("say").arg(text).status();
+    };
+    println!("Bluetooth LE GATT channel via {}", ble_bridge.display());
+    let mut link = BleLink::launch(ble_bridge, trace)?;
+    let mut session = open_session(&mut link)?;
+    let mark = |start: Instant| format!("{:>5.1} s", start.elapsed().as_secs_f32());
+    let start = Instant::now();
+    println!("{} active mode {:02x?}", mark(start), settings::get_active_mode(&mut session));
+
+    let change = Change::Keyboard { key, extra: 0 };
+    let mut guid = [0u8; 16];
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    guid.copy_from_slice(&nanos.to_le_bytes());
+    let entries = settings::profile_entries(&[change.entry(physical)], guid, "xboxctl test", false);
+    let trial = (|| -> Result<(), String> {
+        settings::write_mapping(&mut session, slot, &entries)?;
+        println!("{} wrote slot {slot:#04x}: {}", mark(start), crate::usb::hex(&change.entry(physical)));
+        settings::set_active_mode(&mut session, slot)?;
+        println!("{} switched to slot {slot:#04x}; active mode {:02x?}", mark(start), settings::get_active_mode(&mut session));
+        println!("{} PRESS NOW for {seconds} s", mark(start));
+        speak("現在請按動作按鈕");
+        let until = Instant::now() + Duration::from_secs(seconds);
+        while Instant::now() < until {
+            session.pump(Duration::from_millis(200))?;
+        }
+        speak("可以停了");
+        println!("{} done pressing", mark(start));
+        Ok(())
+    })();
+    if let Err(error) = &trial {
+        println!("{} trial stopped: {error}", mark(start));
+    }
+
+    // Always put things back.
+    let back = settings::set_active_mode(&mut session, 0x00);
+    println!("{} switch back to slot 00: {back:?}; active mode {:02x?}", mark(start), settings::get_active_mode(&mut session));
+    let reset = settings::write_mapping(&mut session, slot, &[]);
+    let after = settings::read_mapping(&mut session, slot).map(|m| m.entries.len());
+    println!("{} reset slot {slot:#04x}: {reset:?}; it now has {after:?} entries", mark(start));
+    back.map_err(|error| format!("{error}; holding the pairing button for about 8 seconds clears the settings"))?;
+    reset?;
+    trial
+}
+
 /// How long to wait for the device to come back after a USB reset, and for
 /// a replug when one is asked for.
 const RESET_TIMEOUT: Duration = Duration::from_secs(10);
